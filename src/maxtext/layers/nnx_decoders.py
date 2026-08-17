@@ -1363,6 +1363,7 @@ class NNXDecoder(nnx.Module):
             "qwen3.5-35b-a3b",
             "qwen3.5-397b-a17b",
             "maxtext-omni-gemma3-qwen3",
+            "cosmos3-nano-reasoner",
         }:
           y = mm_utils.merge_mm_embeddings(
               text_embeddings=y,
@@ -1381,6 +1382,7 @@ class NNXDecoder(nnx.Module):
             "qwen3-vl-30b-a3b",
             "qwen3.5-35b-a3b",
             "qwen3.5-397b-a17b",
+            "cosmos3-nano-reasoner",
         }:
           y = mm_utils.merge_mm_embeddings(
               text_embeddings=y,
