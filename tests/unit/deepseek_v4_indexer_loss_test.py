@@ -39,11 +39,12 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
     self.head_dim = 32
     self.compress_ratio = 4
     self.indexer_n_heads = 4
-    self.indexer_head_dim = 16
+    self.indexer_head_dim = 32
     self.indexer_topk = 2
     self.q_lora_rank = 32
 
   def _get_config(self, indexer_loss_scaling_factor=0.5, indexer_sparse_training=False, mla_qk_head_chunk_size=0):
+    """Constructs a test MaxTextConfig with CSA indexer configuration."""
     argv = [
         "",
         "src/maxtext/configs/base.yml",
@@ -71,6 +72,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
     return pyconfig.initialize(argv)
 
   def _init_csa_attention(self, config):
+    """Initializes a CompressedAttention module for testing."""
     rngs = nnx.Rngs(0)
     mesh = jax.sharding.Mesh(jax.devices(), ("data",))
     attn = attention_compressed.CompressedAttention(
@@ -158,6 +160,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
         compressed_kv=compressed_kv,
         compressed_mask=compressed_mask,
         causal_mask=None,
+        position_ids=None,
         sparse_loss=False,
         scaling_factor=1.0,
     )
@@ -172,7 +175,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
 
     n_windows = self.seq_len // self.compress_ratio
     rng = jax.random.PRNGKey(42)
-    k1, k2, k3, k4 = jax.random.split(rng, 4)
+    k1, k2, k3 = jax.random.split(rng, 3)
     query = jax.random.normal(k1, (self.batch_size, self.seq_len, config_chunked.num_query_heads, config_chunked.head_dim))
     compressed_kv = jax.random.normal(k2, (self.batch_size, n_windows, config_chunked.num_kv_heads, config_chunked.head_dim))
     indexer_score = jax.random.normal(k3, (self.batch_size, self.seq_len, n_windows))
@@ -184,6 +187,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
         compressed_kv=compressed_kv,
         compressed_mask=compressed_mask,
         causal_mask=None,
+        position_ids=None,
         sparse_loss=False,
         scaling_factor=1.0,
     )
@@ -193,6 +197,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
         compressed_kv=compressed_kv,
         compressed_mask=compressed_mask,
         causal_mask=None,
+        position_ids=None,
         sparse_loss=False,
         scaling_factor=1.0,
     )
@@ -230,6 +235,11 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
 
     q_grad_norm = jnp.linalg.norm(grads.csa_compressor.indexer.q_proj.kernel.value)
     self.assertGreater(float(q_grad_norm), 0.0)
+
+    # Gradients must not leak into main model projections
+    self.assertAlmostEqual(float(jnp.linalg.norm(grads.wq_a.kernel.value)), 0.0)
+    self.assertAlmostEqual(float(jnp.linalg.norm(grads.wq_b.kernel.value)), 0.0)
+    self.assertAlmostEqual(float(jnp.linalg.norm(grads.wkv.kernel.value)), 0.0)
 
 
 if __name__ == "__main__":
