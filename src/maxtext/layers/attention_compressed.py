@@ -1603,7 +1603,7 @@ class CompressedAttention(Attention):
           and getattr(self.config, "indexer_loss_scaling_factor", 0.0) > 0.0
           and model_mode == MODEL_MODE_TRAIN
       ):
-        compressed_kv, compressed_mask, indexer_scores = self.csa_compressor(
+        compressed_kv, sparse_compressed_mask, indexer_scores = self.csa_compressor(
             inputs_kv,
             q_normed,
             inputs_positions,
@@ -1618,13 +1618,22 @@ class CompressedAttention(Attention):
               indexer_score=indexer_scores,
               query=q,
               compressed_kv=compressed_kv,
-              compressed_mask=compressed_mask,
+              compressed_mask=sparse_compressed_mask,
               causal_mask=compressed_segment_mask,
               position_ids=inputs_positions,
               sparse_loss=getattr(self.config, "indexer_sparse_training", False),
               scaling_factor=self.config.indexer_loss_scaling_factor,
           )
           self.indexer_loss = indexer_losses(indexer_loss)
+
+        # In Dense Warm-up stage (not indexer_sparse_training), the main attention forward pass
+        # must remain DENSE (no top-k block pruning). In sparse training stage, use the sparse top-k mask.
+        if getattr(self.config, "indexer_sparse_training", False):
+          compressed_mask = sparse_compressed_mask
+        else:
+          compressed_mask = jnp.zeros(
+              (inputs_q.shape[0], 1, inputs_q.shape[1], compressed_kv.shape[1]), dtype=self.dtype
+          )
       else:
         compressed_kv, compressed_mask = self.csa_compressor(
             inputs_kv,
@@ -1784,7 +1793,8 @@ class CompressedAttention(Attention):
     query = jax.lax.stop_gradient(query)
     compressed_kv = jax.lax.stop_gradient(compressed_kv)
 
-    # Construct causal block mask: query token at position t can only attend to block w if (w+1)*r <= t+1
+    # Construct complete teacher mask: causal block mask + segment packing mask
+    # 1. Causal block mask: query at position t can only attend to block w if (w+1)*r <= t+1
     if position_ids is not None:
       usable_len = compressed_len * self.compress_ratio
       block_positions = position_ids[:, : usable_len : self.compress_ratio]
@@ -1797,10 +1807,21 @@ class CompressedAttention(Attention):
 
     c_future = jnp.where(future_mask, DEFAULT_MASK_VALUE, 0.0)
 
-    # DeepSeek-V4 block compression delay: tokens t < compress_rate have zero completed preceding blocks,
-    # producing -inf across all candidate block scores. Softmax([-inf, ...]) evaluates to NaN.
-    # We detect valid tokens with at least one unmasked block and shield all-masked tokens with dummy scores.
-    valid_tokens_mask = jnp.any(c_future > -1e9, axis=-1)  # [batch, q_len]
+    # 2. Segment/packing mask
+    if causal_mask is not None:
+      if causal_mask.ndim == 4:
+        c_seg = causal_mask[:, 0, :, :compressed_len]
+      elif causal_mask.ndim == 3:
+        c_seg = causal_mask[:, :, :compressed_len]
+      else:
+        c_seg = causal_mask
+      teacher_mask = c_future + c_seg
+    else:
+      teacher_mask = c_future
+
+    # Valid tokens mask checks BOTH causal availability and document packing boundaries:
+    # A query token is valid for indexer distillation if it has at least one valid, unmasked block.
+    valid_tokens_mask = jnp.any(teacher_mask > -1e9, axis=-1)  # [batch, q_len]
 
     # Ensure indexer_mask is 2D/3D [batch, q_len, compressed_len]
     if compressed_mask.ndim == 4:
@@ -1812,28 +1833,21 @@ class CompressedAttention(Attention):
     # which is broadcast across all query heads.
     k_vec = compressed_kv[:, :, 0, :] if compressed_kv.ndim == 4 else compressed_kv
 
+    # Student scores: index_scores from DeepseekV4Indexer ALREADY has causal future_mask
+    # and segment attention_mask applied with -inf.
+    # In sparse training mode, also add the sparse top-k indexer_mask.
     if sparse_loss:
       indexer_score = indexer_score + indexer_mask
-    indexer_score = indexer_score + c_future
 
     safe_indexer_score = jnp.where(valid_tokens_mask[:, :, None], indexer_score, 0.0)
     indexer_probs = jax.nn.softmax(safe_indexer_score.astype(jnp.float32), axis=-1)
     indexer_probs = jnp.where(valid_tokens_mask[:, :, None], indexer_probs, 0.0)
-    if causal_mask is not None:
-      if causal_mask.ndim == 4:
-        c_seg = causal_mask[:, 0, :, :compressed_len]
-      elif causal_mask.ndim == 3:
-        c_seg = causal_mask[:, :, :compressed_len]
-      else:
-        c_seg = causal_mask
-      c_total = c_future + c_seg
-    else:
-      c_total = c_future
 
+    # Teacher attention mask: in sparse mode, teacher also attends sparsely using indexer_mask.
     if sparse_loss:
-      c_total = c_total + indexer_mask
+      teacher_mask = teacher_mask + indexer_mask
 
-    c_mask = c_total[:, None, :, :]  # [batch, 1, q_len, compressed_len]
+    c_mask = teacher_mask[:, None, :, :]  # [batch, 1, q_len, compressed_len]
 
     # Chunk across the 'heads' dimension manually using jax.lax.scan if configured
     head_chunk_size = getattr(self.config, "mla_qk_head_chunk_size", 0)
