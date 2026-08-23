@@ -254,35 +254,50 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
     self.assertAlmostEqual(float(jnp.linalg.norm(grads.wkv.kernel.value)), 0.0)
 
   def test_dense_warmup_forward_mask_is_causal_dense(self):
-    """Test that dense warm-up uses causal block masking without top-k pruning."""
-    config = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=False, indexer_topk=1)
-    attn = self._init_csa_attention(config)
+    """Test that dense warm-up forward pass executes the dense causal path by comparing against top-k=1 sparse mode."""
+    config_dense = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=False, indexer_topk=1)
+    config_sparse = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=True, indexer_topk=1)
 
-    n_windows = self.seq_len // self.compress_ratio  # 4 blocks
+    attn_dense = self._init_csa_attention(config_dense)
+    attn_sparse = self._init_csa_attention(config_sparse)
+
+    # Share model parameters between dense and sparse modules
+    state_dense = nnx.state(attn_dense)
+    nnx.update(attn_sparse, state_dense)
+
+    inputs_q = jax.random.normal(jax.random.PRNGKey(1), (self.batch_size, self.seq_len, config_dense.emb_dim))
+    inputs_kv = jax.random.normal(jax.random.PRNGKey(2), (self.batch_size, self.seq_len, config_dense.emb_dim))
     positions = jnp.broadcast_to(jnp.arange(self.seq_len)[None, :], (self.batch_size, self.seq_len))
+    segment_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
 
-    # Construct dense causal mask directly from attention logic
-    usable_len = n_windows * attn.compress_ratio
-    block_positions = positions[:, :usable_len:attn.compress_ratio]
-    is_future = (block_positions[:, None, :] + attn.compress_ratio) > (positions[:, :, None] + 1)
-    dense_causal_mask = jnp.where(is_future, -1e9, 0.0)
+    # Run forward pass through both modules
+    out_dense, _ = attn_dense(
+        inputs_q=inputs_q,
+        inputs_kv=inputs_kv,
+        decoder_segment_ids=segment_ids,
+        inputs_positions=positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
+    out_sparse, _ = attn_sparse(
+        inputs_q=inputs_q,
+        inputs_kv=inputs_kv,
+        decoder_segment_ids=segment_ids,
+        inputs_positions=positions,
+        deterministic=True,
+        model_mode=MODEL_MODE_TRAIN,
+    )
 
-    # For query token t=4 (belongs to block 1): block 0 is unmasked (0.0), block 1 is masked (-1e9)
-    for b in range(self.batch_size):
-      self.assertEqual(float(dense_causal_mask[b, 4, 0]), 0.0)
-      self.assertLess(float(dense_causal_mask[b, 4, 1]), -1e8)
-      self.assertLess(float(dense_causal_mask[b, 4, 2]), -1e8)
-      self.assertLess(float(dense_causal_mask[b, 4, 3]), -1e8)
+    # For query token t=15 (where 4 blocks are valid):
+    # - In dense warm-up, the attention operator attends to all 4 compressed blocks causally.
+    # - In sparse mode with indexer_topk=1, it prunes to only 1 block.
+    # The output representations must differ significantly at t=15 due to dense vs top-1 selection.
+    diff_t15 = jnp.linalg.norm(out_dense[:, 15, :] - out_sparse[:, 15, :])
+    self.assertGreater(float(diff_t15), 0.05)
 
-      # For query token t=8 (belongs to block 2): blocks 0, 1 are unmasked (0.0), blocks 2, 3 are masked (-1e9)
-      self.assertEqual(float(dense_causal_mask[b, 8, 0]), 0.0)
-      self.assertEqual(float(dense_causal_mask[b, 8, 1]), 0.0)
-      self.assertLess(float(dense_causal_mask[b, 8, 2]), -1e8)
-      self.assertLess(float(dense_causal_mask[b, 8, 3]), -1e8)
-
-      # For query token t=15 (last token of block 3): blocks 0, 1, 2, 3 are ALL unmasked (0.0)
-      for w in range(n_windows):
-        self.assertEqual(float(dense_causal_mask[b, 15, w]), 0.0)
+    # Loss must be populated in dense warm-up mode
+    self.assertIsNotNone(attn_dense.indexer_loss)
+    self.assertGreater(float(attn_dense.indexer_loss.value), 0.0)
 
   def test_teacher_causality_and_packing_on_loss_function(self):
     """Test calculate_csa_indexer_loss directly on a 2-segment packed sequence with causal boundaries."""
