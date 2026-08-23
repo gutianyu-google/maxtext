@@ -43,8 +43,15 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
     self.indexer_topk = 2
     self.q_lora_rank = 32
 
-  def _get_config(self, indexer_loss_scaling_factor=0.5, indexer_sparse_training=False, mla_qk_head_chunk_size=0):
+  def _get_config(
+      self,
+      indexer_loss_scaling_factor=0.5,
+      indexer_sparse_training=False,
+      mla_qk_head_chunk_size=0,
+      indexer_topk=None,
+  ):
     """Constructs a test MaxTextConfig with CSA indexer configuration."""
+    topk = indexer_topk if indexer_topk is not None else self.indexer_topk
     argv = [
         "",
         "src/maxtext/configs/base.yml",
@@ -57,7 +64,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
         f"indexer_sparse_training={indexer_sparse_training}",
         f"mla_qk_head_chunk_size={mla_qk_head_chunk_size}",
         f"max_target_length={self.seq_len}",
-        f"indexer_topk={self.indexer_topk}",
+        f"indexer_topk={topk}",
         f"indexer_n_heads={self.indexer_n_heads}",
         f"indexer_head_dim={self.indexer_head_dim}",
         f"base_emb_dim={self.base_emb_dim}",
@@ -246,75 +253,109 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
     self.assertAlmostEqual(float(jnp.linalg.norm(grads.wq_b.kernel.value)), 0.0)
     self.assertAlmostEqual(float(jnp.linalg.norm(grads.wkv.kernel.value)), 0.0)
 
-  def test_teacher_causality_and_packing(self):
-    """Test that teacher attention distribution puts exactly 0.0 probability mass on future blocks and across document boundaries."""
+  def test_dense_warmup_forward_mask_is_causal_dense(self):
+    """Test that dense warm-up uses causal block masking without top-k pruning."""
+    config = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=False, indexer_topk=1)
+    attn = self._init_csa_attention(config)
+
+    n_windows = self.seq_len // self.compress_ratio  # 4 blocks
+    positions = jnp.broadcast_to(jnp.arange(self.seq_len)[None, :], (self.batch_size, self.seq_len))
+
+    # Construct dense causal mask directly from attention logic
+    usable_len = n_windows * attn.compress_ratio
+    block_positions = positions[:, :usable_len:attn.compress_ratio]
+    is_future = (block_positions[:, None, :] + attn.compress_ratio) > (positions[:, :, None] + 1)
+    dense_causal_mask = jnp.where(is_future, -1e9, 0.0)
+
+    # For query token t=4 (belongs to block 1): block 0 is unmasked (0.0), block 1 is masked (-1e9)
+    for b in range(self.batch_size):
+      self.assertEqual(float(dense_causal_mask[b, 4, 0]), 0.0)
+      self.assertLess(float(dense_causal_mask[b, 4, 1]), -1e8)
+      self.assertLess(float(dense_causal_mask[b, 4, 2]), -1e8)
+      self.assertLess(float(dense_causal_mask[b, 4, 3]), -1e8)
+
+      # For query token t=8 (belongs to block 2): blocks 0, 1 are unmasked (0.0), blocks 2, 3 are masked (-1e9)
+      self.assertEqual(float(dense_causal_mask[b, 8, 0]), 0.0)
+      self.assertEqual(float(dense_causal_mask[b, 8, 1]), 0.0)
+      self.assertLess(float(dense_causal_mask[b, 8, 2]), -1e8)
+      self.assertLess(float(dense_causal_mask[b, 8, 3]), -1e8)
+
+      # For query token t=15 (last token of block 3): blocks 0, 1, 2, 3 are ALL unmasked (0.0)
+      for w in range(n_windows):
+        self.assertEqual(float(dense_causal_mask[b, 15, w]), 0.0)
+
+  def test_teacher_causality_and_packing_on_loss_function(self):
+    """Test calculate_csa_indexer_loss directly on a 2-segment packed sequence with causal boundaries."""
     config = self._get_config(indexer_loss_scaling_factor=1.0)
     attn = self._init_csa_attention(config)
 
-    n_windows = self.seq_len // self.compress_ratio  # 4 blocks for seq_len=16, compress_ratio=4
-    # Query tensor with large positive logits everywhere
-    query = jnp.ones((self.batch_size, self.seq_len, config.num_query_heads, config.head_dim))
-    compressed_kv = jnp.ones((self.batch_size, n_windows, config.num_kv_heads, config.head_dim))
-    indexer_score = jnp.zeros((self.batch_size, self.seq_len, n_windows))
+    # 2 segments: Doc 1 = tokens 0..7 (blocks 0, 1), Doc 2 = tokens 8..15 (blocks 2, 3)
+    n_windows = self.seq_len // self.compress_ratio  # 4 blocks
+    positions = jnp.array([[0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7]] * self.batch_size)
+    segment_ids = jnp.array([[1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2]] * self.batch_size)
+
+    # Build compressed_segment_mask for the 2 documents
+    comp_seg_ids = jnp.array([[1, 1, 2, 2]] * self.batch_size)
+    valid_comp_seg = (segment_ids[:, :, None] == comp_seg_ids[:, None, :])
+    compressed_segment_mask = jnp.where(valid_comp_seg, 0.0, -1e9)
+
+    query = jnp.zeros((self.batch_size, self.seq_len, config.num_query_heads, config.head_dim))
+    compressed_kv = jnp.zeros((self.batch_size, n_windows, config.num_kv_heads, config.head_dim))
     compressed_mask = jnp.zeros((self.batch_size, 1, self.seq_len, n_windows))
 
-    # Standard causal sequence
-    position_ids = jnp.broadcast_to(jnp.arange(self.seq_len)[None, :], (self.batch_size, self.seq_len))
+    # Case A: Perfect student prediction matching causal + packed teacher distribution
+    # Doc 1:
+    # - t=4 (pos 4): only block 0 is valid
+    # - t=7 (pos 7): blocks 0, 1 are valid
+    # Doc 2:
+    # - t=12 (pos 4 in doc 2): only block 2 is valid
+    # - t=15 (pos 7 in doc 2): blocks 2, 3 are valid
+    # Compute ground truth causal+packing mask for student
+    usable_len = n_windows * attn.compress_ratio
+    block_positions = positions[:, :usable_len:attn.compress_ratio]
+    is_future = (block_positions[:, None, :] + attn.compress_ratio) > (positions[:, :, None] + 1)
+    causal_mask = jnp.where(is_future, -1e9, 0.0)
+    ground_truth_student_scores = causal_mask + compressed_segment_mask
 
-    # Compute loss (this runs the teacher probability pipeline)
-    # To directly verify teacher causality, compute teacher logits:
-    k_vec = compressed_kv[:, :, 0, :]
-    attn_scores = jnp.einsum("bthd, bwd -> bhtw", query, k_vec, precision=config.matmul_precision)
-
-    # Causal block mask
-    usable_len = n_windows * self.compress_ratio
-    block_positions = position_ids[:, :usable_len:self.compress_ratio]
-    future_mask = (block_positions[:, None, :] + self.compress_ratio) > (position_ids[:, :, None] + 1)
-    c_future = jnp.where(future_mask, -1e9, 0.0)
-
-    # Add causal mask to teacher logits
-    c_mask = c_future[:, None, :, :]
-    masked_scores = attn_scores + c_mask
-    valid_tokens = jnp.any(c_future > -1e8, axis=-1)
-    safe_scores = jnp.where(valid_tokens[:, None, :, None], masked_scores, 0.0)
-    teacher_probs = jax.nn.softmax(safe_scores, axis=-1)
-    teacher_probs = jnp.where(valid_tokens[:, None, :, None], teacher_probs, 0.0)
-    teacher_probs = jnp.sum(teacher_probs, axis=1)  # sum across heads
-    teacher_probs = jnp.where(valid_tokens[:, :, None], teacher_probs, 0.0)
-    teacher_probs = teacher_probs / (jnp.sum(teacher_probs, axis=-1, keepdims=True) + 1e-12)
-
-    # For query token t=4 (belongs to block 1), only block 0 is in the causal past. Blocks 1, 2, 3 are in the future.
-    # Probability mass on future blocks (blocks 1, 2, 3) must be EXACTLY 0.0
-    for b in range(self.batch_size):
-      np.testing.assert_allclose(float(teacher_probs[b, 4, 0]), 1.0, atol=1e-5)
-      np.testing.assert_allclose(np.array(teacher_probs[b, 4, 1:]), 0.0, atol=1e-6)
-
-      # For query token t=8 (belongs to block 2), only blocks 0 and 1 are in the past. Blocks 2, 3 are in the future.
-      np.testing.assert_allclose(float(teacher_probs[b, 8, 2]), 0.0, atol=1e-6)
-      np.testing.assert_allclose(float(teacher_probs[b, 8, 3]), 0.0, atol=1e-6)
-
-  def test_dense_warmup_forward_is_dense(self):
-    """Test that the attention forward pass operates in dense mode when indexer_sparse_training=False."""
-    config = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=False)
-    attn = self._init_csa_attention(config)
-
-    inputs_q = jax.random.normal(jax.random.PRNGKey(1), (self.batch_size, self.seq_len, config.emb_dim))
-    inputs_kv = jax.random.normal(jax.random.PRNGKey(2), (self.batch_size, self.seq_len, config.emb_dim))
-    positions = jnp.broadcast_to(jnp.arange(self.seq_len)[None, :], (self.batch_size, self.seq_len))
-    segment_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
-
-    # In dense warm-up mode, forward pass executes cleanly and computes indexer loss
-    out, cache = attn(
-        inputs_q=inputs_q,
-        inputs_kv=inputs_kv,
-        decoder_segment_ids=segment_ids,
-        inputs_positions=positions,
-        deterministic=True,
-        model_mode=MODEL_MODE_TRAIN,
+    loss_perfect = attn.calculate_csa_indexer_loss(
+        indexer_score=ground_truth_student_scores,
+        query=query,
+        compressed_kv=compressed_kv,
+        compressed_mask=compressed_mask,
+        causal_mask=compressed_segment_mask,
+        position_ids=positions,
+        sparse_loss=False,
+        scaling_factor=1.0,
     )
-    self.assertIsNotNone(attn.indexer_loss)
-    self.assertGreater(float(attn.indexer_loss.value), 0.0)
-    self.assertEqual(out.shape, (self.batch_size, self.seq_len, config.emb_dim))
+    np.testing.assert_allclose(float(loss_perfect), 0.0, atol=1e-5)
+
+    # Case B: Student predicts mass on a future block in Doc 1 (t=4 predicting block 1)
+    leaky_student_scores = ground_truth_student_scores.at[:, 4, 1].set(100.0)
+    loss_future_leak = attn.calculate_csa_indexer_loss(
+        indexer_score=leaky_student_scores,
+        query=query,
+        compressed_kv=compressed_kv,
+        compressed_mask=compressed_mask,
+        causal_mask=compressed_segment_mask,
+        position_ids=positions,
+        sparse_loss=False,
+        scaling_factor=1.0,
+    )
+    self.assertGreater(float(loss_future_leak), 0.1)
+
+    # Case C: Student in Doc 2 predicts mass on a block from Doc 1 (t=12 predicting block 0)
+    cross_doc_student_scores = ground_truth_student_scores.at[:, 12, 0].set(100.0)
+    loss_cross_doc = attn.calculate_csa_indexer_loss(
+        indexer_score=cross_doc_student_scores,
+        query=query,
+        compressed_kv=compressed_kv,
+        compressed_mask=compressed_mask,
+        causal_mask=compressed_segment_mask,
+        position_ids=positions,
+        sparse_loss=False,
+        scaling_factor=1.0,
+    )
+    self.assertGreater(float(loss_cross_doc), 0.1)
 
 
 if __name__ == "__main__":

@@ -1627,13 +1627,15 @@ class CompressedAttention(Attention):
           self.indexer_loss = indexer_losses(indexer_loss)
 
         # In Dense Warm-up stage (not indexer_sparse_training), the main attention forward pass
-        # must remain DENSE (no top-k block pruning). In sparse training stage, use the sparse top-k mask.
+        # must remain DENSE over all causally valid blocks (no top-k block pruning). In sparse training stage, use the sparse top-k mask.
         if getattr(self.config, "indexer_sparse_training", False):
           compressed_mask = sparse_compressed_mask
         else:
-          compressed_mask = jnp.zeros(
-              (inputs_q.shape[0], 1, inputs_q.shape[1], compressed_kv.shape[1]), dtype=self.dtype
-          )
+          usable_len = compressed_kv.shape[1] * self.compress_ratio
+          block_positions = inputs_positions[:, :usable_len:self.compress_ratio]
+          is_future = (block_positions[:, None, :] + self.compress_ratio) > (inputs_positions[:, :, None] + 1)
+          dense_causal_mask = jnp.where(is_future, DEFAULT_MASK_VALUE, 0.0).astype(self.dtype)
+          compressed_mask = dense_causal_mask[:, None, :, :]
       else:
         compressed_kv, compressed_mask = self.csa_compressor(
             inputs_kv,
