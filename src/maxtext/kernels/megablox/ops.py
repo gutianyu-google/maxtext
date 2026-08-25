@@ -90,8 +90,8 @@ def gmm(
     #   get_current_rule has to be called outside of the _gmm_fwd function.
     # 2. for batchsplit, explicitly pass the rule
     quantization_rule = qwix_rule if qwix_rule else qpl.get_current_rule("gmm")
-    # if not quantization_rule or not isinstance(quantization_rule, qwix.QtRule):
-    #   raise ValueError(f"Expect a QtRule for quantized training. But get quantization_rule={quantization_rule} for gmm.")
+    if not quantization_rule or not isinstance(quantization_rule, qwix.QtRule):
+      raise ValueError(f"Expect a QtRule for quantized training. But get quantization_rule={quantization_rule} for gmm.")
   else:
     # Handcraft a rule that matches the AQT's behavior.
     if lhs_quantize_dtype or rhs_quantize_dtype:
