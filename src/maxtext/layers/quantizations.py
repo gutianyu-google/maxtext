@@ -807,7 +807,7 @@ def get_fp8_full_qwix_rule_w_sparsity(config: Config):
   return [
       qwix.QtRule(
           # module_path="decoder/.*layers.*",
-          module_path="(decoder|mtp_block)/.*layers.*",
+          module_path="(decoder/.*layers.*|mtp_block/.*)",
           weight_qtype=jnp.float8_e4m3fn,
           act_qtype=jnp.float8_e4m3fn,
           bwd_qtype=jnp.float8_e5m2,
