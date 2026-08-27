@@ -221,6 +221,9 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
 
   def test_csa_indexer_gradients_flow(self):
     """Test that gradients flow to indexer parameters and do not leak into main projections or inputs."""
+    positions = jnp.broadcast_to(jnp.arange(self.seq_len)[None, :], (self.batch_size, self.seq_len))
+    segment_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
+
     for is_sparse in (False, True):
       with self.subTest(indexer_sparse_training=is_sparse):
         config = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=is_sparse)
@@ -228,8 +231,6 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
 
         inputs_q = jax.random.normal(jax.random.PRNGKey(1), (self.batch_size, self.seq_len, config.emb_dim))
         inputs_kv = jax.random.normal(jax.random.PRNGKey(2), (self.batch_size, self.seq_len, config.emb_dim))
-        positions = jnp.broadcast_to(jnp.arange(self.seq_len)[None, :], (self.batch_size, self.seq_len))
-        segment_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
 
         def loss_fn(attn_model, q, kv):
           attn_model(
@@ -268,7 +269,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
 
   def test_dense_warmup_forward_mask_is_causal_dense(self):
     """Test that dense warm-up forward pass executes the dense causal path.
-    
+
     Asserts mask values and compares against top-k=1 sparse mode.
     """
     # Case A: Verify scale=0, indexer_sparse_training=False stays dense and produces no indexer loss
@@ -353,7 +354,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
 
     # Build compressed_segment_mask for the 2 documents
     comp_seg_ids = jnp.array([[1, 1, 2, 2]] * self.batch_size)
-    valid_comp_seg = (segment_ids[:, :, None] == comp_seg_ids[:, None, :])
+    valid_comp_seg = segment_ids[:, :, None] == comp_seg_ids[:, None, :]
     compressed_segment_mask = jnp.where(valid_comp_seg, 0.0, DEFAULT_MASK_VALUE)
 
     query = jnp.zeros((self.batch_size, self.seq_len, config.num_query_heads, config.head_dim))
@@ -362,7 +363,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
 
     # Ground truth student prediction matching causal + packed teacher distribution
     usable_len = n_windows * attn.compress_ratio
-    block_positions = positions[:, :usable_len:attn.compress_ratio]
+    block_positions = positions[:, : usable_len : attn.compress_ratio]
     is_future = (block_positions[:, None, :] + attn.compress_ratio) > (positions[:, :, None] + 1)
     causal_mask = jnp.where(is_future, DEFAULT_MASK_VALUE, 0.0)
     ground_truth_student_scores = causal_mask + compressed_segment_mask

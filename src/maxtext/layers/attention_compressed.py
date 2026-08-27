@@ -1756,7 +1756,7 @@ class CompressedAttention(Attention):
     if sparse_compressed_mask is not None:
       return sparse_compressed_mask
     usable_len = compressed_len * self.compress_ratio
-    block_positions = inputs_positions[:, :usable_len:self.compress_ratio]
+    block_positions = inputs_positions[:, : usable_len : self.compress_ratio]
     is_future = (block_positions[:, None, :] + self.compress_ratio) > (inputs_positions[:, :, None] + 1)
     dense_causal_mask = jnp.where(is_future, DEFAULT_MASK_VALUE, 0.0).astype(self.dtype)
     return dense_causal_mask[:, None, :, :]
