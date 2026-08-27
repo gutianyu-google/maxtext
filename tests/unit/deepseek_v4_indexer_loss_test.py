@@ -42,6 +42,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
     self.indexer_head_dim = 32
     self.indexer_topk = 2
     self.q_lora_rank = 32
+    self._get_config()
 
   def _get_config(
       self,
@@ -221,9 +222,6 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
 
   def test_csa_indexer_gradients_flow(self):
     """Test that gradients flow to indexer parameters and do not leak into main projections or inputs."""
-    positions = jnp.broadcast_to(jnp.arange(self.seq_len)[None, :], (self.batch_size, self.seq_len))
-    segment_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
-
     for is_sparse in (False, True):
       with self.subTest(indexer_sparse_training=is_sparse):
         config = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=is_sparse)
@@ -231,13 +229,15 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
 
         inputs_q = jax.random.normal(jax.random.PRNGKey(1), (self.batch_size, self.seq_len, config.emb_dim))
         inputs_kv = jax.random.normal(jax.random.PRNGKey(2), (self.batch_size, self.seq_len, config.emb_dim))
+        positions = jnp.broadcast_to(jnp.arange(self.seq_len)[None, :], (self.batch_size, self.seq_len))
+        segment_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
 
-        def loss_fn(attn_model, q, kv):
+        def loss_fn(attn_model, q, kv, seg=segment_ids, pos=positions):
           attn_model(
               inputs_q=q,
               inputs_kv=kv,
-              decoder_segment_ids=segment_ids,
-              inputs_positions=positions,
+              decoder_segment_ids=seg,
+              inputs_positions=pos,
               deterministic=True,
               model_mode=MODEL_MODE_TRAIN,
           )
