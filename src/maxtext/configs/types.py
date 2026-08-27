@@ -2325,6 +2325,15 @@ class DevelopmentAndDebugging(BaseModel):
       False,
       description="If True, perform extra checks using jax.checkify, affecting performance.",
   )
+  debug_tensor_distribution: bool = Field(
+      False,
+      description="Enable tensor distribution debugging in FWD and BWD passes.",
+  )
+  debug_tensor_distribution_layers: str = Field(
+      "all",
+      description=("Filter layers/submodules to debug ('all' or comma-separated names)."),
+  )
+  debug_tensor_distribution_step_interval: int = Field(1, description="Step frequency interval for debug tensor logging.")
 
   @classmethod
   def _clean_empty_string_for_list(cls, v: Any) -> Any:

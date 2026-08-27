@@ -1103,6 +1103,10 @@ vertex_tensorboard_region: ""
 
 # If set to true, MaxText will perform extra checks using jax.checkify. Note that this will effect performance.
 max_checkify: false
+# Enable tensor distribution debugging across forward and backward passes.
+debug_tensor_distribution: false
+debug_tensor_distribution_layers: "all"
+debug_tensor_distribution_step_interval: 1
 
 # Inference
 inference_microbenchmark_prefill_lengths: "64,128,256,512,1024"
