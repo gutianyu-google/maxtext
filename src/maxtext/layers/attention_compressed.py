@@ -915,7 +915,7 @@ class DeepseekV4Indexer(nnx.Module):
     if attention_mask is not None:
       att_m = attention_mask[:, :, :compressed_len]
       index_scores += att_m
-      combined_invalid = combined_invalid | (att_m < -100.0)
+      combined_invalid = combined_invalid | (att_m < (DEFAULT_MASK_VALUE / 2))
 
     top_k_indices = jax.lax.top_k(index_scores, k)[1]
     invalid = jnp.take_along_axis(combined_invalid, top_k_indices, axis=-1)
@@ -1619,7 +1619,7 @@ class CompressedAttention(Attention):
               query=q,
               compressed_kv=compressed_kv,
               compressed_mask=sparse_compressed_mask,
-              causal_mask=compressed_segment_mask,
+              segment_mask=compressed_segment_mask,
               position_ids=inputs_positions,
               sparse_loss=getattr(self.config, "indexer_sparse_training", False),
               scaling_factor=self.config.indexer_loss_scaling_factor,
@@ -1751,7 +1751,7 @@ class CompressedAttention(Attention):
       query: Array,
       compressed_kv: Array,
       compressed_mask: Array,
-      causal_mask: Optional[Array | None] = None,
+      segment_mask: Optional[Array | None] = None,
       position_ids: Optional[Array | None] = None,
       sparse_loss: bool = False,
       scaling_factor: float = 1.0,
@@ -1768,14 +1768,18 @@ class CompressedAttention(Attention):
     4. Aggregate probabilities by summing across all attention heads.
     5. Apply L1-normalization across the compressed block sequence dimension.
 
-    target_distribution = L1_Normalize(Sum_h(Softmax_w(Q @ K_comp^T + causal_mask)))
+    target_distribution = L1_Normalize(Sum_h(Softmax_w(Q @ K_comp^T + teacher_mask)))
+
+    Reference:
+    DeepSeek-V4 (CSA / Lightning Indexer) - Paper §2.3.1, Eqs. 13–17
+    DeepSeek-V3.2 - https://arxiv.org/pdf/2512.02556
 
     Args:
       indexer_score: Scores predicted by indexer [batch, q_len, compressed_len].
       query: Query tensor from main model [batch, q_len, heads, dim].
       compressed_kv: Compressed KV tensor from main model [batch, compressed_len, 1, dim].
       compressed_mask: Indexer compressed mask [batch, 1, q_len, compressed_len] or [batch, q_len, compressed_len].
-      causal_mask: Segment mask [batch, q_len, compressed_len] or [batch, 1, q_len, compressed_len] or None.
+      segment_mask: Segment mask [batch, q_len, compressed_len] or [batch, 1, q_len, compressed_len] or None.
       position_ids: Token position IDs [batch, q_len] or None.
       sparse_loss: Whether to use sparse loss.
       scaling_factor: The scaling factor for the loss.
@@ -1810,20 +1814,20 @@ class CompressedAttention(Attention):
     c_future = jnp.where(future_mask, DEFAULT_MASK_VALUE, 0.0)
 
     # 2. Segment/packing mask
-    if causal_mask is not None:
-      if causal_mask.ndim == 4:
-        c_seg = causal_mask[:, 0, :, :compressed_len]
-      elif causal_mask.ndim == 3:
-        c_seg = causal_mask[:, :, :compressed_len]
+    if segment_mask is not None:
+      if segment_mask.ndim == 4:
+        c_seg = segment_mask[:, 0, :, :compressed_len]
+      elif segment_mask.ndim == 3:
+        c_seg = segment_mask[:, :, :compressed_len]
       else:
-        c_seg = causal_mask
+        c_seg = segment_mask
       teacher_mask = c_future + c_seg
     else:
       teacher_mask = c_future
 
     # Valid tokens mask checks BOTH causal availability and document packing boundaries:
     # A query token is valid for indexer distillation if it has at least one valid, unmasked block.
-    valid_tokens_mask = jnp.any(teacher_mask > -1e9, axis=-1)  # [batch, q_len]
+    valid_tokens_mask = jnp.any(teacher_mask > (DEFAULT_MASK_VALUE / 2), axis=-1)  # [batch, q_len]
 
     # Ensure indexer_mask is 2D/3D [batch, q_len, compressed_len]
     if compressed_mask.ndim == 4:
@@ -1853,7 +1857,7 @@ class CompressedAttention(Attention):
 
     # Chunk across the 'heads' dimension manually using jax.lax.scan if configured
     head_chunk_size = getattr(self.config, "mla_qk_head_chunk_size", 0)
-    if head_chunk_size > 0 and heads % head_chunk_size == 0:
+    if head_chunk_size > 0:
       num_chunks = heads // head_chunk_size
       q_h = query.transpose(2, 0, 1, 3).reshape(num_chunks, head_chunk_size, batch, q_len, dim)
 

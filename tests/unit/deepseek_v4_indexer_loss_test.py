@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from maxtext.common.common_types import MODEL_MODE_TRAIN
+from maxtext.common.common_types import MODEL_MODE_TRAIN, DEFAULT_MASK_VALUE
 from maxtext.configs import pyconfig
 from maxtext.layers import attention_compressed
 from maxtext.layers.attention_mla import indexer_losses
@@ -164,14 +164,14 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
     q_pos = jnp.arange(self.seq_len)[:, None]
     block_end_pos = (jnp.arange(n_windows)[None, :] + 1) * self.compress_ratio
     future_mask = block_end_pos > (q_pos + 1)
-    indexer_score = jnp.where(future_mask[None, :, :], -1e9, 0.0)
+    indexer_score = jnp.where(future_mask[None, :, :], DEFAULT_MASK_VALUE, 0.0)
 
     loss = attn.calculate_csa_indexer_loss(
         indexer_score=indexer_score,
         query=query,
         compressed_kv=compressed_kv,
         compressed_mask=compressed_mask,
-        causal_mask=None,
+        segment_mask=None,
         position_ids=None,
         sparse_loss=False,
         scaling_factor=1.0,
@@ -198,7 +198,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
         query=query,
         compressed_kv=compressed_kv,
         compressed_mask=compressed_mask,
-        causal_mask=None,
+        segment_mask=None,
         position_ids=None,
         sparse_loss=False,
         scaling_factor=1.0,
@@ -208,7 +208,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
         query=query,
         compressed_kv=compressed_kv,
         compressed_mask=compressed_mask,
-        causal_mask=None,
+        segment_mask=None,
         position_ids=None,
         sparse_loss=False,
         scaling_factor=1.0,
@@ -216,7 +216,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
     np.testing.assert_allclose(float(loss_chunked), float(loss_native), rtol=1e-5, atol=1e-5)
 
   def test_csa_indexer_gradients_flow(self):
-    """Test that gradients flow to indexer parameters and do not leak into main projections."""
+    """Test that gradients flow to indexer parameters and do not leak into main projections or inputs."""
     config = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=False)
     attn = self._init_csa_attention(config)
 
@@ -312,24 +312,17 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
     # Build compressed_segment_mask for the 2 documents
     comp_seg_ids = jnp.array([[1, 1, 2, 2]] * self.batch_size)
     valid_comp_seg = (segment_ids[:, :, None] == comp_seg_ids[:, None, :])
-    compressed_segment_mask = jnp.where(valid_comp_seg, 0.0, -1e9)
+    compressed_segment_mask = jnp.where(valid_comp_seg, 0.0, DEFAULT_MASK_VALUE)
 
     query = jnp.zeros((self.batch_size, self.seq_len, config.num_query_heads, config.head_dim))
     compressed_kv = jnp.zeros((self.batch_size, n_windows, config.num_kv_heads, config.head_dim))
     compressed_mask = jnp.zeros((self.batch_size, 1, self.seq_len, n_windows))
 
-    # Case A: Perfect student prediction matching causal + packed teacher distribution
-    # Doc 1:
-    # - t=4 (pos 4): only block 0 is valid
-    # - t=7 (pos 7): blocks 0, 1 are valid
-    # Doc 2:
-    # - t=12 (pos 4 in doc 2): only block 2 is valid
-    # - t=15 (pos 7 in doc 2): blocks 2, 3 are valid
-    # Compute ground truth causal+packing mask for student
+    # Ground truth student prediction matching causal + packed teacher distribution
     usable_len = n_windows * attn.compress_ratio
     block_positions = positions[:, :usable_len:attn.compress_ratio]
     is_future = (block_positions[:, None, :] + attn.compress_ratio) > (positions[:, :, None] + 1)
-    causal_mask = jnp.where(is_future, -1e9, 0.0)
+    causal_mask = jnp.where(is_future, DEFAULT_MASK_VALUE, 0.0)
     ground_truth_student_scores = causal_mask + compressed_segment_mask
 
     loss_perfect = attn.calculate_csa_indexer_loss(
@@ -337,7 +330,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
         query=query,
         compressed_kv=compressed_kv,
         compressed_mask=compressed_mask,
-        causal_mask=compressed_segment_mask,
+        segment_mask=compressed_segment_mask,
         position_ids=positions,
         sparse_loss=False,
         scaling_factor=1.0,
@@ -351,7 +344,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
         query=query,
         compressed_kv=compressed_kv,
         compressed_mask=compressed_mask,
-        causal_mask=compressed_segment_mask,
+        segment_mask=compressed_segment_mask,
         position_ids=positions,
         sparse_loss=False,
         scaling_factor=1.0,
@@ -365,12 +358,38 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
         query=query,
         compressed_kv=compressed_kv,
         compressed_mask=compressed_mask,
-        causal_mask=compressed_segment_mask,
+        segment_mask=compressed_segment_mask,
         position_ids=positions,
         sparse_loss=False,
         scaling_factor=1.0,
     )
     self.assertGreater(float(loss_cross_doc), 0.1)
+
+  def test_csa_indexer_loss_jit_compile(self):
+    """Compile smoke test: verifies that jitting forward pass with CSA indexer loss executes cleanly."""
+    config = self._get_config(indexer_loss_scaling_factor=0.5, indexer_sparse_training=False)
+    attn = self._init_csa_attention(config)
+
+    inputs_q = jax.random.normal(jax.random.PRNGKey(1), (self.batch_size, self.seq_len, config.emb_dim))
+    inputs_kv = jax.random.normal(jax.random.PRNGKey(2), (self.batch_size, self.seq_len, config.emb_dim))
+    positions = jnp.broadcast_to(jnp.arange(self.seq_len)[None, :], (self.batch_size, self.seq_len))
+    segment_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
+
+    @nnx.jit
+    def jitted_forward(attn_model, q, kv, seg, pos):
+      out, _ = attn_model(
+          inputs_q=q,
+          inputs_kv=kv,
+          decoder_segment_ids=seg,
+          inputs_positions=pos,
+          deterministic=True,
+          model_mode=MODEL_MODE_TRAIN,
+      )
+      return out, attn_model.indexer_loss.value
+
+    out, loss_val = jitted_forward(attn, inputs_q, inputs_kv, segment_ids, positions)
+    self.assertEqual(out.shape, (self.batch_size, self.seq_len, config.emb_dim))
+    self.assertGreater(float(loss_val), 0.0)
 
 
 if __name__ == "__main__":
