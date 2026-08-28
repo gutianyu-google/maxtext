@@ -58,6 +58,7 @@ from maxtext.models import (
     gemma4_small,
     gpt3,
     gpt_oss,
+    lineage_sparse_adapter,
     llama2,
     llama4,
     mistral,
@@ -1903,31 +1904,41 @@ class NNXDecoder(nnx.Module):
             num_moe = cfg.num_decoder_layers - cfg.first_num_dense_layers
 
             if cfg.use_batch_split_schedule:
-              policy = self.get_remat_policy()
-              mock_params = self._build_linen_params(self.moe_layers)
-
-              if cfg.quantization and cfg.use_qwix_quantization and not cfg.use_manual_quantization:
-                y = deepseek_batchsplit_fp8.scan_batch_split_layers(
-                    y,
-                    mock_params,
-                    decoder_positions,
-                    decoder_segment_ids,
-                    model_mode=model_mode,
-                    mesh=self.mesh,
-                    quant=self.quant,
-                    cfg=cfg,
-                    policy=policy,
-                )
-              else:
-                # bf16 code path
-                y = deepseek_batchsplit.scan_batch_split_layers(
-                    y,
-                    mock_params,
-                    decoder_positions,
+              if getattr(cfg, "use_lineage_sparse_layers", False):
+                y = lineage_sparse_adapter.run_lineage_sparse_layers(
+                    inputs=y,
+                    params=self._build_linen_params(self.moe_layers),
+                    decoder_positions=decoder_positions,
                     mesh=self.mesh,
                     cfg=cfg,
                     num_layers=num_moe,
                 )
+              else:
+                policy = self.get_remat_policy()
+                mock_params = self._build_linen_params(self.moe_layers)
+
+                if cfg.quantization and cfg.use_qwix_quantization and not cfg.use_manual_quantization:
+                  y = deepseek_batchsplit_fp8.scan_batch_split_layers(
+                      y,
+                      mock_params,
+                      decoder_positions,
+                      decoder_segment_ids,
+                      model_mode=model_mode,
+                      mesh=self.mesh,
+                      quant=self.quant,
+                      cfg=cfg,
+                      policy=policy,
+                  )
+                else:
+                  # bf16 code path
+                  y = deepseek_batchsplit.scan_batch_split_layers(
+                      y,
+                      mock_params,
+                      decoder_positions,
+                      mesh=self.mesh,
+                      cfg=cfg,
+                      num_layers=num_moe,
+                  )
             else:
               y, self.moe_layers, _ = self._apply_layers_sequentially(
                   self.moe_layers,

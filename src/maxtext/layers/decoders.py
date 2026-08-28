@@ -33,10 +33,10 @@ from maxtext.layers import linears
 from maxtext.layers import mhc
 from maxtext.layers import normalizations
 from maxtext.layers import pipeline
-from maxtext.layers.nnx_decoders import NNXDecoderLayer, NNXSequentialPipelineStage, NNXScannedPipelineStage
 from maxtext.layers import quantizations
 from maxtext.layers.attentions import attention_as_linen
 from maxtext.layers.embeddings import attend_on_embedding, embed_as_linen, positional_embedding_as_linen
+from maxtext.layers.nnx_decoders import NNXDecoderLayer, NNXScannedPipelineStage, NNXSequentialPipelineStage
 from maxtext.layers.normalizations import rms_norm
 from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.models import (
@@ -52,6 +52,7 @@ from maxtext.models import (
     gemma4_small,
     gpt3,
     gpt_oss,
+    lineage_sparse_adapter,
     llama2,
     llama4,
     mistral,
@@ -59,16 +60,16 @@ from maxtext.models import (
     olmo3,
     qwen2,
     qwen3,
-    qwen3_custom,
     qwen3_5,
+    qwen3_custom,
     simple_layer,
 )
 from maxtext.multimodal import utils as mm_utils
-from maxtext.utils.sharding import create_sharding
 from maxtext.utils import max_logging
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
 from maxtext.utils import sharding
+from maxtext.utils.sharding import create_sharding
 
 # ------------------------------------------------------------------------------
 # The network: Decoder Definitions
@@ -1009,31 +1010,41 @@ class Decoder(nn.Module):
             # as detected by immutable params, use deepseek_batchsplit custom
             # scan with initialized parameters.
             if cfg.use_batch_split_schedule and not self.is_mutable_collection("params"):
-              # old version of batch-split that fully uses qwix quantization.
-              if cfg.quantization and cfg.use_qwix_quantization and not cfg.use_manual_quantization:
-                y = deepseek_batchsplit_fp8.scan_batch_split_layers(
-                    y,
-                    self.variables["params"]["moe_layers"],
-                    decoder_positions,
-                    decoder_segment_ids,
-                    model_mode=model_mode,
-                    mesh=mesh,
-                    quant=self.quant,
-                    cfg=cfg,
-                    policy=policy,
-                )
-              else:
-                # bf16 and fp8 code path for pure-JAX batch-split.
-                # fp8 code path supports both manual quantization and qwix
-                # quantization.
-                y = deepseek_batchsplit.scan_batch_split_layers(
-                    y,
-                    self.variables["params"]["moe_layers"],
-                    decoder_positions,
+              if getattr(cfg, "use_lineage_sparse_layers", False):
+                y = lineage_sparse_adapter.run_lineage_sparse_layers(
+                    inputs=y,
+                    params=self.variables["params"]["moe_layers"],
+                    decoder_positions=decoder_positions,
                     mesh=mesh,
                     cfg=cfg,
                     num_layers=num_moe_layers,
                 )
+              else:
+                # old version of batch-split that fully uses qwix quantization.
+                if cfg.quantization and cfg.use_qwix_quantization and not cfg.use_manual_quantization:
+                  y = deepseek_batchsplit_fp8.scan_batch_split_layers(
+                      y,
+                      self.variables["params"]["moe_layers"],
+                      decoder_positions,
+                      decoder_segment_ids,
+                      model_mode=model_mode,
+                      mesh=mesh,
+                      quant=self.quant,
+                      cfg=cfg,
+                      policy=policy,
+                  )
+                else:
+                  # bf16 and fp8 code path for pure-JAX batch-split.
+                  # fp8 code path supports both manual quantization and qwix
+                  # quantization.
+                  y = deepseek_batchsplit.scan_batch_split_layers(
+                      y,
+                      self.variables["params"]["moe_layers"],
+                      decoder_positions,
+                      mesh=mesh,
+                      cfg=cfg,
+                      num_layers=num_moe_layers,
+                  )
             else:
               y, _ = self.scan_decoder_layers(
                   cfg,

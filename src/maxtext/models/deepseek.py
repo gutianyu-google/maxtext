@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """Transformer model definition."""
+
 # pylint: disable=arguments-differ
 # pylint: disable=no-name-in-module
 
@@ -24,8 +25,8 @@ import jax
 from jax.ad_checkpoint import checkpoint_name
 import jax.numpy as jnp
 from jax.sharding import Mesh
-from maxtext.common.common_types import Config, AttentionType
-from maxtext.common.common_types import HyperConnectionType, MODEL_MODE_PREFILL, DecoderBlockType
+from maxtext.common.common_types import AttentionType, Config
+from maxtext.common.common_types import DecoderBlockType, HyperConnectionType, MODEL_MODE_PREFILL
 from maxtext.layers import attention_mla
 from maxtext.layers import initializers
 from maxtext.layers import linears
@@ -33,17 +34,16 @@ from maxtext.layers import mhc
 from maxtext.layers import moe
 from maxtext.layers import nnx_wrappers
 from maxtext.layers import quantizations
-from maxtext.layers.linears import Dropout
 from maxtext.layers.engram import Engram
 from maxtext.layers.engram import NgramHashMapping
+from maxtext.layers.linears import Dropout
 from maxtext.layers.normalizations import RMSNorm
 from maxtext.models import deepseek_batchsplit
 from maxtext.models import deepseek_batchsplit_fp8
 from maxtext.utils import max_utils
 from maxtext.utils.sharding import create_sharding
-from maxtext.utils.sharding import maybe_shard_with_logical
 from maxtext.utils.sharding import get_logical_axis_rules
-
+from maxtext.utils.sharding import maybe_shard_with_logical
 import transformers
 
 # -----------------------------------------
@@ -340,7 +340,12 @@ class DeepSeekDenseLayer(DeepSeekGenericLayer):
     )
 
   def mlp_op(self, x, deterministic, *args, **kwargs):
-    mlp = self.mlp(x, deterministic, intermediate_sharding=self.mlp_intermediate_sharding, out_sharding=self.out_sharding)
+    mlp = self.mlp(
+        x,
+        deterministic,
+        intermediate_sharding=self.mlp_intermediate_sharding,
+        out_sharding=self.out_sharding,
+    )
     return self.with_logical_constraint(mlp)
 
   def __call__(
@@ -443,6 +448,20 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
     if isinstance(inputs, tuple):
       inputs = inputs[0]
 
+    if getattr(self.config, "use_lineage_sparse_layers", False):
+      x = self.with_logical_constraint(inputs)
+      x = checkpoint_name(x, "decoder_layer_input")
+      hidden_states, intermediate_inputs = self.self_attention_with_norm_op(
+          x,
+          decoder_segment_ids,
+          decoder_positions,
+          deterministic,
+          model_mode,
+          previous_chunk,
+          slot,
+      )
+      return hidden_states + intermediate_inputs, None
+
     # This code should only be traced during initialization when using
     # batch-split schedule. It is never run during model execution, since
     # `Decoder` directly calls `batch_split_schedule` during execution.
@@ -468,7 +487,8 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
         dpos = deepseek_batchsplit_fp8.split(decoder_positions, self.config.batch_split_factor)
         dseg = deepseek_batchsplit_fp8.split(decoder_segment_ids, self.config.batch_split_factor)
         weights = deepseek_batchsplit_fp8.fetch_weights(
-            nnx.to_pure_dict(nnx.state(self, (nnx.Param, moe.MoEBiasVar))), self.config.dtype
+            nnx.to_pure_dict(nnx.state(self, (nnx.Param, moe.MoEBiasVar))),
+            self.config.dtype,
         )
         outputs = deepseek_batchsplit_fp8.batch_split_schedule(
             inputs,
@@ -538,7 +558,8 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
         return x
 
       weights = deepseek_batchsplit.fetch_weights(
-          nnx.to_pure_dict(nnx.state(self, (nnx.Param, moe.MoEBiasVar)), extract_fn), self.config.dtype
+          nnx.to_pure_dict(nnx.state(self, (nnx.Param, moe.MoEBiasVar)), extract_fn),
+          self.config.dtype,
       )
       weights = deepseek_batchsplit.gather_weights(weights, self.mesh)
       outputs, _ = deepseek_batchsplit.batch_split_schedule(
@@ -610,9 +631,15 @@ class DeepSeekMoELayer(DeepSeekGenericLayer):
 
   def mlp_op(self, x, deterministic, *args, **kwargs):
     mlp_lnx, load_balance_loss, moe_bias_updates = self.DeepSeekMoeBlock_0(
-        x, intermediate_sharding=self.mlp_intermediate_sharding, out_sharding=self.out_sharding
+        x,
+        intermediate_sharding=self.mlp_intermediate_sharding,
+        out_sharding=self.out_sharding,
     )
-    return self.with_logical_constraint(mlp_lnx), load_balance_loss, moe_bias_updates
+    return (
+        self.with_logical_constraint(mlp_lnx),
+        load_balance_loss,
+        moe_bias_updates,
+    )
 
 
 DeepSeekMoELayerToLinen = nnx_wrappers.to_linen_class(

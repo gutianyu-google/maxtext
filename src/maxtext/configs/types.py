@@ -234,6 +234,7 @@ ModelName = Literal[
     "deepseek3-671b",
     "deepseek3-671b-2dfsdp",
     "deepseek3-671b-batchsplit",
+    "deepseek3-671b-lineage",
     "deepseek3-test",
     "deepseek3-tiny",
     "deepseek3.2-671b",
@@ -1120,6 +1121,30 @@ class DeepSeekMoE(BaseModel):
   batch_split_factor: int = Field(
       1,
       description="Factor by which to split the batch into micro-batches. Only used if use_batch_split_schedule is True.",
+  )
+  use_lineage_sparse_layers: bool = Field(
+      False,
+      description="Whether to use Lineage DeepSeek-V3 sparse layers scan.",
+  )
+  lineage_attention_sharding: Literal["head", "sequence"] = Field(
+      "head",
+      description=("Attention sharding strategy for Lineage sparse layers ('head' or" " 'sequence')."),
+  )
+  lineage_activation_checkpointing: bool = Field(
+      False,
+      description=("Whether to use activation checkpointing in Lineage sparse layers."),
+  )
+  lineage_capacity_factor: float = Field(
+      -1.0,
+      description=(
+          "Capacity factor determining the destination buffer size for Lineage"
+          " sparse dispatch. If <= 0, falls back to capacity_factor or"
+          " ragged_buffer_factor."
+      ),
+  )
+  lineage_mesh_axes_mapping: dict[str, Any] = Field(
+      default_factory=dict,
+      description=("Custom mapping from Lineage logical axes to mesh physical axes."),
   )
 
 
