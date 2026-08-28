@@ -1614,10 +1614,11 @@ class CompressedAttention(Attention):
             return_indexer_scores=True,
         )
         is_sparse_training = getattr(self.config, "indexer_sparse_training", False)
+        use_sparse_mask = (model_mode != MODEL_MODE_TRAIN) or is_sparse_training
         compressed_mask = self.get_compressed_mask(
             inputs_positions,
             compressed_kv.shape[1],
-            sparse_compressed_mask=sparse_compressed_mask if is_sparse_training else None,
+            sparse_compressed_mask=sparse_compressed_mask if use_sparse_mask else None,
         )
 
         if (

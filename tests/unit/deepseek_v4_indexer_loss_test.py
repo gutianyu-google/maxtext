@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from maxtext.common.common_types import MODEL_MODE_TRAIN, DEFAULT_MASK_VALUE
+from maxtext.common.common_types import MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_PREFILL, MODEL_MODE_TRAIN, DEFAULT_MASK_VALUE
 from maxtext.configs import pyconfig
 from maxtext.layers import attention_compressed
 from maxtext.layers.attention_mla import indexer_losses
@@ -433,6 +433,25 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
     out, loss_val = jitted_forward(attn, inputs_q, inputs_kv, segment_ids, positions)
     self.assertEqual(out.shape, (self.batch_size, self.seq_len, config.emb_dim))
     self.assertGreater(float(loss_val), 0.0)
+
+  def test_inference_mask_routing_uses_sparse_mask(self):
+    """Test that in inference modes (prefill/ar), mask routing selects sparse mask even if indexer_sparse_training=False."""
+    config = self._get_config(indexer_loss_scaling_factor=0.0, indexer_sparse_training=False, indexer_topk=1)
+    attn = self._init_csa_attention(config)
+
+    positions = jnp.broadcast_to(jnp.arange(self.seq_len)[None, :], (self.batch_size, self.seq_len))
+    sparse_mask = jnp.full((self.batch_size, 1, self.seq_len, 4), DEFAULT_MASK_VALUE)
+
+    # In train mode with indexer_sparse_training=False: dense causal mask is built
+    train_sparse = getattr(config, "indexer_sparse_training", False)
+    dense_mask = attn.get_compressed_mask(positions, 4, sparse_compressed_mask=sparse_mask if train_sparse else None)
+    np.testing.assert_allclose(np.array(dense_mask[:, 0, 15, :]), 0.0, atol=1e-5)
+
+    # In inference modes (prefill and autoregressive): sparse mask must be routed
+    for mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
+      use_sparse = (mode != MODEL_MODE_TRAIN) or getattr(config, "indexer_sparse_training", False)
+      routed_mask = attn.get_compressed_mask(positions, 4, sparse_compressed_mask=sparse_mask if use_sparse else None)
+      np.testing.assert_allclose(np.array(routed_mask), np.array(sparse_mask), atol=1e-5)
 
 
 if __name__ == "__main__":
