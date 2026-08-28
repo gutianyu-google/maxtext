@@ -358,6 +358,31 @@ class Checkpointing(BaseModel):
       description="Subdirectory to move checkpoints to before deletion. (Ignored if directory is prefixed with gs://)",
   )
   checkpoint_todelete_full_path: str | None = Field(None, description="Full path to move checkpoints to before deletion.")
+  standalone_checkpointer_per_step_interval: float = Field(
+      0.0,
+      description="Interval in seconds between iterations in standalone checkpointer benchmark loop.",
+  )
+  standalone_checkpointer_drop_page_cache_before_restore: bool = Field(
+      False,
+      description=(
+          "Whether to execute sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' before restoring a checkpoint in"
+          " standalone_checkpointer loop (use for storage benchmarking only)."
+      ),
+  )
+  standalone_checkpointer_enable_restore_in_loop: bool = Field(
+      True,
+      description=(
+          "In standalone_checkpointer loop, whether to restore checkpoint after saving in each step (defaults to True"
+          " for bidirectional storage read/write benchmarking)."
+      ),
+  )
+  standalone_checkpointer_start_from_checkpoint: bool = Field(
+      False,
+      description=(
+          "In standalone_checkpointer, whether to start by attempting to load an existing checkpoint before setting"
+          " up training state (for checkpoint restore benchmarking)."
+      ),
+  )
   force_unroll: bool = Field(
       False,
       description="During param-only checkpoint generation, whether to unroll the loop.",
@@ -2805,6 +2830,27 @@ class DerivedValues(BaseModel):
 # ----------------------------------------------------------------------------
 
 
+# Decoder blocks that support router replay (`forced_routed_experts`). All are
+# homogeneous-MoE, so a 4D layer axis is just the decoder layer index;
+# interleaved architectures (Llama4/Envy) would need a MoE-only counter.
+# Requires the pure-NNX decoder. GEMMA4 is unscanned-only (see nnx_decoders.py).
+FORCED_ROUTING_SUPPORTED_DECODER_BLOCKS = (
+    DecoderBlockType.QWEN3_5,
+    DecoderBlockType.MIXTRAL,
+    DecoderBlockType.GEMMA4,
+)
+
+
+def check_forced_routing_support(decoder_block: DecoderBlockType) -> None:
+  """Raises NotImplementedError if `decoder_block` does not support router replay."""
+  if decoder_block not in FORCED_ROUTING_SUPPORTED_DECODER_BLOCKS:
+    raise NotImplementedError(
+        "Forced routing (router replay) is only supported for decoder_block in"
+        f" {FORCED_ROUTING_SUPPORTED_DECODER_BLOCKS}; got"
+        f" decoder_block={decoder_block!r}."
+    )
+
+
 def _normalize_axes(axes: Any) -> tuple[str, ...]:
   """Normalize a logical-rule mapping value to a tuple of axis name strings.
 
@@ -2824,6 +2870,22 @@ def _normalize_axes(axes: Any) -> tuple[str, ...]:
   return ()
 
 
+def axes_for_logical(logical_axis_rules: list, logical_axis: str) -> tuple[str, ...]:
+  """Return the physical axes *logical_axis* is mapped to by *logical_axis_rules*.
+
+  Args:
+    logical_axis_rules: The list of ``[logical_name, physical_axes]`` pairs.
+    logical_axis: The logical axis name to look up.
+
+  Returns:
+    A (possibly empty) tuple of physical axis name strings.
+  """
+  for rule in logical_axis_rules:
+    if rule and len(rule) >= 2 and rule[0] == logical_axis:
+      return _normalize_axes(rule[1])
+  return ()
+
+
 def infer_cp_axes(logical_axis_rules: list) -> tuple[str, ...]:
   """Infer which physical mesh axis/axes serve as Context Parallelism (CP).
 
@@ -2838,10 +2900,7 @@ def infer_cp_axes(logical_axis_rules: list) -> tuple[str, ...]:
     A tuple of physical axis name strings that act as CP.  Empty if the
     ``activation_length`` logical axis is not found in the rules.
   """
-  for rule in logical_axis_rules:
-    if rule and len(rule) >= 2 and rule[0] == "activation_length":
-      return _normalize_axes(rule[1])
-  return ()
+  return axes_for_logical(logical_axis_rules, "activation_length")
 
 
 def infer_ep_axes(logical_axis_rules: list) -> tuple[str, ...]:
@@ -2896,6 +2955,20 @@ def get_individual_scales(scale: int) -> tuple[int, int, int, int]:
   emb_scale = base_scale + int(rem > 1)
   layer_scale = base_scale
   return emb_scale, num_head_scale, mlp_dim_scale, layer_scale
+
+
+def _resolved_fsdp_size(mesh_axes: list[str], parallelism: list[int], num_devices: int) -> int:
+  """Combined size of the fsdp mesh axes, resolving a `-1` the way mesh creation will.
+
+  `maxtext_utils.fill_unspecified_mesh_axes` hands the single -1 entry whatever devices the
+  other axes leave over, so config validation has to do the same to see the sizes a run will
+  really get. A -1 that cannot be resolved here (an unknown device count, say) counts as 1;
+  mesh creation raises on its own if it is still unresolvable there.
+  """
+  specified = prod(size for size in parallelism if size != -1)
+  leftover = num_devices // specified if specified > 0 and num_devices > 0 and num_devices % specified == 0 else 1
+  sizes = {axis: leftover if size == -1 else size for axis, size in zip(mesh_axes, parallelism)}
+  return max(sizes.get("fsdp", 1), 1) * max(sizes.get("fsdp_transpose", 1), 1)
 
 
 # ----------------------------------------------------------------------------
@@ -3241,6 +3314,38 @@ class MaxTextConfig(
     else:
       eval_config = self._load_mesh_config_from_yaml(self.custom_mesh_and_rule_for_eval.value)
       self.logical_axis_rules_for_eval = eval_config.get("logical_axis_rules", self.logical_axis_rules)
+
+      # Only the logical rules are swapped for eval; the mesh itself is built once from
+      # the primary rule. Axes the eval rule names but the mesh lacks silently resolve to
+      # "replicated", which is only harmless while those axes would have been size 1.
+      dropped_axes = [axis for axis in eval_config.get("mesh_axes", ()) if axis not in self.mesh_axes]
+      if dropped_axes:
+        logger.warning(
+            "custom_mesh_and_rule_for_eval=%s declares mesh axes %s that are absent from the mesh built for "
+            "custom_mesh_and_rule=%s; they are ignored and any eval rule referencing them is treated as replicated.",
+            self.custom_mesh_and_rule_for_eval.value,
+            dropped_axes,
+            self.custom_mesh_and_rule.value,
+        )
+
+      # The input pipeline reorders the batch once, for the CP extent of the
+      # *train* rules. When the eval rule shards the query differently the
+      # permutation no longer matches, so `AttentionOp` falls back to the plain
+      # causal path at eval. Correct, but a silent loss of load balancing.
+      train_q_axes = axes_for_logical(self.logical_axis_rules, "activation_q_length")
+      eval_q_axes = axes_for_logical(self.logical_axis_rules_for_eval, "activation_q_length")
+      if self.context_parallel_load_balance and train_q_axes != eval_q_axes:
+        logger.warning(
+            "context_parallel_load_balance=True but activation_q_length maps to %s under "
+            "custom_mesh_and_rule=%s and to %s under custom_mesh_and_rule_for_eval=%s. The input pipeline "
+            "reorders for the train extent only, so load balancing is disabled at eval; eval attention runs "
+            "unbalanced (the last CP shard does ~2*cp/(cp+1) of the average work). Everything outside the "
+            "sequence-quadratic term stays balanced.",
+            list(train_q_axes),
+            self.custom_mesh_and_rule.value,
+            list(eval_q_axes),
+            self.custom_mesh_and_rule_for_eval.value,
+        )
 
     # A. SET RUN NAME AND PATHS
     # If run_name is not set, generate one from the JOBSET_NAME environment variable (if available)
@@ -3846,6 +3951,15 @@ class MaxTextConfig(
               "Sparse indexer with MLA is only supported with dot_product attention or flash "
               "attention with tokamax splash."
           )
+        if (
+            self.attention == "flash"
+            and self.context_parallel_strategy == "all_gather"
+            and self.ici_context_parallelism * self.dcn_context_parallelism > 1
+            and self.attention_sink
+        ):
+          raise ValueError(
+              "Sparse indexer with all-gather context parallelism for flash attention does not support attention sinks."
+          )
         if self.indexer_loss_scaling_factor > 0.0 and self.indexer_topk >= self.max_target_length:
           raise ValueError(
               f"`indexer_topk` ({self.indexer_topk}) must be < `max_target_length` ({self.max_target_length}) "
@@ -4047,6 +4161,9 @@ class MaxTextConfig(
           "qwen3",
           "qwen3_moe",
           "qwen3_custom_moe",
+          "gemma",
+          "gemma2",
+          "gemma3",
       }
       if self.decoder_block.value not in supported_decoders:
         raise ValueError(
@@ -4437,6 +4554,24 @@ class MaxTextConfig(
         "pcp": (1),
     }
     self.dcn_parallelism = [dcn_map[axis] for axis in self.mesh_axes]
+
+    # Zero-1 (`shard_optimizer_over_data`) shards the optimizer moments over the "data"
+    # axis on top of whatever layout the parameters already have. FSDP shards the
+    # parameters over "fsdp", so combining the two leaves the gradients sharded
+    # P('fsdp', ...) while the moments they are added to are sharded P(('data', 'fsdp'), ...).
+    # Under `shard_mode=explicit` that add is a hard type error, and under `auto` GSPMD
+    # only papers over it with an extra collective. Keep the two mutually exclusive.
+    if self.shard_optimizer_over_data:
+      fsdp_size = _resolved_fsdp_size(
+          self.mesh_axes, self.ici_parallelism, self.num_target_devices // max(self.num_slices, 1)
+      ) * _resolved_fsdp_size(self.mesh_axes, self.dcn_parallelism, self.num_slices)
+      if fsdp_size > 1:
+        raise ValueError(
+            "`shard_optimizer_over_data` (Zero-1) cannot be combined with FSDP: the resolved "
+            f"fsdp/fsdp_transpose mesh axes have a combined size of {fsdp_size}. Set "
+            "`ici_fsdp_parallelism` and `ici_fsdp_transpose_parallelism` (and their `dcn_` "
+            "counterparts) to 1, or turn off `shard_optimizer_over_data`."
+        )
 
     # Diloco params
     # Resolve dcn_diloco_parallelism=-1 if left unspecified, using the same convention as dcn_data_parallelism.
