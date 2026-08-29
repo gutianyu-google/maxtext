@@ -296,7 +296,7 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
 
     Asserts mask values and compares against top-k=1 sparse mode.
     """
-    # Case A: Verify scale=0, indexer_sparse_training=False stays dense and produces no indexer loss
+    # Case A: Verify default pre-training (scale=0) executes cleanly without registering indexer loss
     config_unscaled = self._get_config(indexer_loss_scaling_factor=0.0, indexer_sparse_training=False)
     attn_unscaled = self._init_csa_attention(config_unscaled)
 
