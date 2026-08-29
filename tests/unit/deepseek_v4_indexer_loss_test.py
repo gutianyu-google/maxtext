@@ -24,6 +24,30 @@ from maxtext.common.common_types import MODEL_MODE_AUTOREGRESSIVE, MODEL_MODE_PR
 from maxtext.configs import pyconfig
 from maxtext.layers import attention_compressed
 from maxtext.layers.attention_mla import indexer_losses
+from maxtext.trainers.pre_train import train as pre_train
+
+
+class _MockNnxDecoder(nnx.Module):
+  """Minimal mock NNX decoder for pre_train.loss_fn tests."""
+
+  def __init__(self, vocab_size: int):
+    self.vocab_size = vocab_size
+    self.mesh = jax.make_mesh((1, 1, 1, 1), ("data", "fsdp", "expert", "context"))
+
+  def __call__(
+      self,
+      decoder_input_tokens,
+      decoder_positions,
+      decoder_segment_ids=None,
+      encoder_images=None,
+      encoder_image_masks=None,
+      enable_dropout=False,
+      decoder_target_tokens=None,
+      decoder_target_mask=None,
+  ):
+    del decoder_positions, decoder_segment_ids, encoder_images, encoder_image_masks
+    del enable_dropout, decoder_target_tokens, decoder_target_mask
+    return jnp.zeros((*decoder_input_tokens.shape, self.vocab_size), dtype=jnp.float32)
 
 
 class DeepSeekV4IndexerLossTest(unittest.TestCase):
@@ -434,24 +458,63 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
     self.assertEqual(out.shape, (self.batch_size, self.seq_len, config.emb_dim))
     self.assertGreater(float(loss_val), 0.0)
 
-  def test_inference_mask_routing_uses_sparse_mask(self):
-    """Test that in inference modes (prefill/ar), mask routing selects sparse mask even if indexer_sparse_training=False."""
-    config = self._get_config(indexer_loss_scaling_factor=0.0, indexer_sparse_training=False, indexer_topk=1)
-    attn = self._init_csa_attention(config)
-
+  def test_mask_routing_matrix(self):
+    """Verify mask routing selects sparse mask by default, and dense only during active dense warmup."""
     positions = jnp.broadcast_to(jnp.arange(self.seq_len)[None, :], (self.batch_size, self.seq_len))
     sparse_mask = jnp.full((self.batch_size, 1, self.seq_len, 4), DEFAULT_MASK_VALUE)
 
-    # In train mode with indexer_sparse_training=False: dense causal mask is built
-    train_sparse = getattr(config, "indexer_sparse_training", False)
-    dense_mask = attn.get_compressed_mask(positions, 4, sparse_compressed_mask=sparse_mask if train_sparse else None)
-    np.testing.assert_allclose(np.array(dense_mask[:, 0, 15, :]), 0.0, atol=1e-5)
+    # (mode, scaling_factor, sparse_training, expected_is_sparse)
+    test_matrix = [
+        (MODEL_MODE_TRAIN, 0.0, False, True),  # Default pre-training: sparse mask
+        (MODEL_MODE_TRAIN, 1.0, False, False),  # Active dense warm-up: dense causal mask
+        (MODEL_MODE_TRAIN, 1.0, True, True),  # Sparse training: sparse mask
+        (MODEL_MODE_PREFILL, 0.0, False, True),  # Prefill inference: sparse mask
+        (MODEL_MODE_AUTOREGRESSIVE, 0.0, False, True),  # AR decode inference: sparse mask
+    ]
 
-    # In inference modes (prefill and autoregressive): sparse mask must be routed
-    for mode in (MODEL_MODE_PREFILL, MODEL_MODE_AUTOREGRESSIVE):
-      use_sparse = (mode != MODEL_MODE_TRAIN) or getattr(config, "indexer_sparse_training", False)
-      routed_mask = attn.get_compressed_mask(positions, 4, sparse_compressed_mask=sparse_mask if use_sparse else None)
-      np.testing.assert_allclose(np.array(routed_mask), np.array(sparse_mask), atol=1e-5)
+    for mode, scale, sparse_training, expected_sparse in test_matrix:
+      config = self._get_config(indexer_loss_scaling_factor=scale, indexer_sparse_training=sparse_training)
+      attn = self._init_csa_attention(config)
+      is_dense_warmup = (mode == MODEL_MODE_TRAIN) and (scale > 0.0) and (not sparse_training)
+      use_sparse_mask = not is_dense_warmup
+      routed = attn.get_compressed_mask(positions, 4, sparse_compressed_mask=sparse_mask if use_sparse_mask else None)
+
+      if expected_sparse:
+        np.testing.assert_allclose(np.array(routed), np.array(sparse_mask), atol=1e-5)
+      else:
+        np.testing.assert_allclose(np.array(routed[:, 0, 15, :]), 0.0, atol=1e-5)
+
+  def test_default_scale_zero_computes_lm_loss_and_no_indexer_loss(self):
+    """Verify that with use_indexer=True and indexer_loss_scaling_factor=0.0, loss_fn computes normal LM loss."""
+    data = {
+        "inputs": jnp.zeros((self.batch_size, self.seq_len), dtype=jnp.int32),
+        "inputs_position": jnp.broadcast_to(jnp.arange(self.seq_len), (self.batch_size, self.seq_len)),
+        "inputs_segmentation": jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32),
+        "targets": jnp.zeros((self.batch_size, self.seq_len), dtype=jnp.int32),
+        "targets_segmentation": jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32),
+    }
+    cfg_default = self._get_config(indexer_loss_scaling_factor=0.0, indexer_sparse_training=False)
+    mock_model = _MockNnxDecoder(vocab_size=cfg_default.vocab_size)
+
+    # Case 1: Default configuration (use_indexer=True, scaling_factor=0.0, sparse_training=False)
+    # Must compute normal LM loss (xent_sum > 0)
+    loss_default, aux_default = pre_train.loss_fn(mock_model, cfg_default, data, None, None, is_train=True)
+    self.assertGreater(float(aux_default["xent_sum"]), 0.0)
+    self.assertGreater(float(loss_default), 0.0)
+
+    # Case 2: Dense warm-up configuration (use_indexer=True, scaling_factor=1.0, sparse_training=False)
+    # Must zero out main model LM loss (xent_sum == 0.0)
+    cfg_warmup = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=False)
+    _, aux_warmup = pre_train.loss_fn(mock_model, cfg_warmup, data, None, None, is_train=True)
+    self.assertEqual(float(aux_warmup["xent_sum"]), 0.0)
+    self.assertEqual(float(aux_warmup["z_loss"]), 0.0)
+
+    # Case 3: Sparse training configuration (use_indexer=True, scaling_factor=1.0, sparse_training=True)
+    # Must compute normal LM loss (xent_sum > 0)
+    cfg_sparse = self._get_config(indexer_loss_scaling_factor=1.0, indexer_sparse_training=True)
+    loss_sparse, aux_sparse = pre_train.loss_fn(mock_model, cfg_sparse, data, None, None, is_train=True)
+    self.assertGreater(float(aux_sparse["xent_sum"]), 0.0)
+    self.assertGreater(float(loss_sparse), 0.0)
 
 
 if __name__ == "__main__":

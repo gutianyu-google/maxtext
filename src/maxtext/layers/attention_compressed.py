@@ -1614,7 +1614,8 @@ class CompressedAttention(Attention):
             return_indexer_scores=True,
         )
         is_sparse_training = getattr(self.config, "indexer_sparse_training", False)
-        use_sparse_mask = (model_mode != MODEL_MODE_TRAIN) or is_sparse_training
+        is_dense_warmup = (model_mode == MODEL_MODE_TRAIN) and (scaling_factor > 0.0) and (not is_sparse_training)
+        use_sparse_mask = not is_dense_warmup
         compressed_mask = self.get_compressed_mask(
             inputs_positions,
             compressed_kv.shape[1],
