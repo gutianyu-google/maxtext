@@ -3967,12 +3967,11 @@ class MaxTextConfig(
               "short-circuits to select all tokens and no indexer loss is produced."
           )
       elif self.attention_type == AttentionType.COMPRESSED.value:
-        csa_ratios = [r for r in self.compress_ratios if r == 4]
-        compress_rate = csa_ratios[0] if csa_ratios else 4
+        compress_rate = 4
         max_blocks = self.max_target_length // compress_rate
-        if self.indexer_loss_scaling_factor > 0.0 and self.indexer_topk >= max_blocks:
+        if self.indexer_loss_scaling_factor > 0.0 and self.indexer_topk > max_blocks:
           raise ValueError(
-              f"`indexer_topk` ({self.indexer_topk}) must be < total compressed blocks ({max_blocks}) "
+              f"`indexer_topk` ({self.indexer_topk}) must be <= total compressed blocks ({max_blocks}) "
               f"(max_target_length={self.max_target_length} // compress_rate={compress_rate}) "
               "when indexer loss is enabled (`indexer_loss_scaling_factor > 0.0`)."
           )

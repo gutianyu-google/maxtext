@@ -1598,8 +1598,8 @@ class CompressedAttention(Attention):
           inputs_kv, q_normed, inputs_positions, model_mode, self.compressor_cache
       )
     elif self.compress_ratio == 4:
-      use_indexer = getattr(self.config, "use_indexer", False)
-      scaling_factor = getattr(self.config, "indexer_loss_scaling_factor", 0.0)
+      use_indexer = self.config.use_indexer
+      scaling_factor = self.config.indexer_loss_scaling_factor
       should_compute_loss = use_indexer and scaling_factor > 0.0 and model_mode == MODEL_MODE_TRAIN
 
       if use_indexer:
@@ -1613,7 +1613,7 @@ class CompressedAttention(Attention):
             self.indexer_cache,
             return_indexer_scores=True,
         )
-        is_sparse_training = getattr(self.config, "indexer_sparse_training", False)
+        is_sparse_training = self.config.indexer_sparse_training
         is_dense_warmup = (model_mode == MODEL_MODE_TRAIN) and (scaling_factor > 0.0) and (not is_sparse_training)
         use_sparse_mask = not is_dense_warmup
         compressed_mask = self.get_compressed_mask(
@@ -1858,8 +1858,10 @@ class CompressedAttention(Attention):
     k_vec = compressed_kv[:, :, 0, :] if compressed_kv.ndim == 4 else compressed_kv
 
     # Student scores: index_scores from DeepseekV4Indexer ALREADY has causal future_mask
-    # and segment attention_mask applied with -inf.
-    # In sparse training mode, also add the sparse top-k indexer_mask.
+    # applied with -inf and segment attention_mask applied with DEFAULT_MASK_VALUE.
+    # In sparse training mode, also add the sparse top-k indexer_mask. Summing two
+    # DEFAULT_MASK_VALUE values on unselected masked tokens is benign as both drive
+    # softmax probability to 0.0.
     if sparse_loss:
       indexer_score = indexer_score + indexer_mask
 
