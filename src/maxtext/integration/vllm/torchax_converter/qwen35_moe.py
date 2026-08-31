@@ -12,7 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Qwen 3.5 MaxText to vLLM Converter (Supports 35B MoE Hybrid Architecture)."""
+"""Qwen 3.5 MaxText to vLLM Converter (Supports 35B MoE Hybrid Architecture).
+
+Emits tensors keyed by tpu-inference's torchax runner state names, in the runner's
+*internal* layout (matching tpu-inference `process_linear_weights` /
+`process_moe_weights` with the GMM_TP MoE backend):
+
+  * linear kernels are stored transposed, ``[in, out]``, with the out dimension of
+    fused projections reordered so each tensor-parallel shard holds its own
+    contiguous ``[q | k | v]`` (or ``[q | k | v | z]``, ``[gate | up]``) block;
+  * KV heads are replicated (each head ``tp // num_kv_heads`` times, consecutively)
+    when ``tp`` exceeds the KV head count, mirroring vLLM's ``QKVParallelLinear``;
+  * routed experts are ``w13 = [E, D, tp * 2 * pad128(F/tp)]`` (per-shard
+    ``[gate | up]`` chunks, each 128-padded) and ``w2 = [E, F, D]``;
+  * ``o_proj`` / GDN ``out_proj`` / shared ``down_proj`` are the MaxText kernels
+    unchanged -- they are already ``[in, out]``.
+
+Because this file mirrors the internal layout, it must be revalidated whenever
+tpu-inference changes it (`validate_converter.py`, or the canonical-layout sync
+path which delegates the layout to tpu-inference).
+"""
 
 import gc
 import logging
@@ -43,8 +62,12 @@ class Qwen35MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
     with timer("Convert MoE Weights"):
       self._convert_moe(model_state)
 
-    # Protect JAX compilation by enforcing bfloat16
-    self.vllm_state = {key: weight.astype(jnp.bfloat16) for key, weight in self.vllm_state.items()}
+    # Protect JAX compilation by enforcing bfloat16. A_log stays float32: the
+    # runner keeps it in float32 and bfloat16 would round it.
+    self.vllm_state = {
+        key: weight.astype(jnp.float32 if key.endswith(".A_log") else jnp.bfloat16)
+        for key, weight in self.vllm_state.items()
+    }
 
     return self.vllm_state
 
@@ -58,6 +81,16 @@ class Qwen35MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
     self.vllm_state["vllm_model.language_model.lm_head.weight"] = jnp.transpose(
         params["base"]["decoder"]["logits_dense"]["kernel"], (1, 0)
     )
+
+  def _replicate_kv_heads(self, kv):
+    """[D, n_kv, dh] -> [D, n_kv * replicas, dh] with each head repeated
+    consecutively, as vLLM's QKVParallelLinear lays KV heads out when
+    tp > num_kv_heads (rank r reads head r // replicas)."""
+    n_kv = kv.shape[1]
+    if self.vllm_tp <= n_kv:
+      return kv
+    assert self.vllm_tp % n_kv == 0, f"tp={self.vllm_tp} must be a multiple of num_kv_heads={n_kv}"
+    return jnp.repeat(kv, self.vllm_tp // n_kv, axis=1)
 
   def _convert_attn(self, params):
     """Converts attention weights."""
@@ -94,7 +127,11 @@ class Qwen35MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
           self.vllm_state[f"{prefix}.input_layernorm.weight"] = pre_ln[rep]
           self.vllm_state[f"{prefix}.post_attention_layernorm.weight"] = post_ln[rep]
 
-          q, k, v = q_layers[rep], k_layers[rep], v_layers[rep]
+          # q carries the attention output gate ([q | gate] per head); k/v are
+          # replicated up to one head per shard when tp > num_kv_heads.
+          q = q_layers[rep]
+          k = self._replicate_kv_heads(k_layers[rep])
+          v = self._replicate_kv_heads(v_layers[rep])
 
           q_T = jnp.transpose(q, (1, 2, 0))
           k_T = jnp.transpose(k, (1, 2, 0))
@@ -109,8 +146,13 @@ class Qwen35MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
               jnp.concatenate([q_tp_shards[t], k_tp_shards[t], v_tp_shards[t]], axis=0) for t in range(tp_size)
           ]
 
-          self.vllm_state[f"{prefix}.self_attn.qkv_proj.weight"] = jnp.concatenate(tp_interleaved, axis=0)
-          self.vllm_state[f"{prefix}.self_attn.o_proj.weight"] = jnp.transpose(o_layers[rep], (1, 0))
+          # The runner stores linear kernels transposed: [in, out].
+          self.vllm_state[f"{prefix}.self_attn.qkv_proj.weight"] = jnp.transpose(
+              jnp.concatenate(tp_interleaved, axis=0), (1, 0)
+          )
+          # MaxText's out.kernel is [H*dh, D] which already is the runner's
+          # [in, out] layout for o_proj.
+          self.vllm_state[f"{prefix}.self_attn.o_proj.weight"] = o_layers[rep]
           self.vllm_state[f"{prefix}.self_attn.q_norm.weight"] = qnorm_layers[rep]
           self.vllm_state[f"{prefix}.self_attn.k_norm.weight"] = knorm_layers[rep]
 
@@ -157,7 +199,9 @@ class Qwen35MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
           qkvz_interleaved = [
               jnp.concatenate([q_shards[s], k_shards[s], v_shards[s], z_shards[s]], axis=0) for s in range(tp_size)
           ]
-          self.vllm_state[f"{prefix}.linear_attn.in_proj_qkvz.weight"] = jnp.concatenate(qkvz_interleaved, axis=0)
+          self.vllm_state[f"{prefix}.linear_attn.in_proj_qkvz.weight"] = jnp.transpose(
+              jnp.concatenate(qkvz_interleaved, axis=0), (1, 0)
+          )
 
           # Extract MaxText GDN BA Layout
           t_m_ba = jnp.transpose(ba_layers[rep], (1, 0))
@@ -171,9 +215,12 @@ class Qwen35MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
           a_shards = jnp.split(a, tp_size, axis=0)
 
           ba_interleaved = [jnp.concatenate([b_shards[s], a_shards[s]], axis=0) for s in range(tp_size)]
-          self.vllm_state[f"{prefix}.linear_attn.in_proj_ba.weight"] = jnp.concatenate(ba_interleaved, axis=0)
+          self.vllm_state[f"{prefix}.linear_attn.in_proj_ba.weight"] = jnp.transpose(
+              jnp.concatenate(ba_interleaved, axis=0), (1, 0)
+          )
 
-          self.vllm_state[f"{prefix}.linear_attn.out_proj.weight"] = jnp.transpose(out_layers[rep], (1, 0))
+          # MaxText's out_proj.kernel is [H_v*D_v, D]: already the runner's [in, out].
+          self.vllm_state[f"{prefix}.linear_attn.out_proj.weight"] = out_layers[rep]
           self.vllm_state[f"{prefix}.linear_attn.conv1d.weight"] = jnp.transpose(conv_layers[rep], (2, 1, 0))
           self.vllm_state[f"{prefix}.linear_attn.A_log"] = A_log_layers[rep]
           self.vllm_state[f"{prefix}.linear_attn.dt_bias"] = dt_bias_layers[rep]
@@ -238,7 +285,9 @@ class Qwen35MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
         shared = mlp_block["shared_expert"]
         sh_gate_layers = jnp.unstack(jnp.transpose(shared["wi_0"]["kernel"], (1, 2, 0)), axis=0)
         sh_up_layers = jnp.unstack(jnp.transpose(shared["wi_1"]["kernel"], (1, 2, 0)), axis=0)
-        sh_down_layers = jnp.unstack(jnp.transpose(shared["wo"]["kernel"], (1, 2, 0)), axis=0)
+        # wo.kernel is [F, layer, D]; per-layer [F, D] is already the runner's
+        # [in, out] layout for down_proj.
+        sh_down_layers = jnp.unstack(shared["wo"]["kernel"], axis=1)
 
         if "shared_expert_gate" in mlp_block:
           sh_gate_router_layers = jnp.unstack(jnp.transpose(mlp_block["shared_expert_gate"]["kernel"], (1, 2, 0)), axis=0)
@@ -248,6 +297,12 @@ class Qwen35MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
         p = f"vllm_model.language_model.model.layers.{i}"
 
         self.vllm_state[f"{p}.mlp.gate.weight"] = router_weights[rep]
+        # Current vLLM nests the expert tensors under a `routed_experts`
+        # submodule; older versions keep them on the FusedMoE layer directly.
+        # Emit both names (same array, no copy) and let the structural sync
+        # pick whichever the target has.
+        self.vllm_state[f"{p}.mlp.experts.routed_experts.w13_weight"] = w13_layers[rep]
+        self.vllm_state[f"{p}.mlp.experts.routed_experts.w2_weight"] = down_layers[rep]
         self.vllm_state[f"{p}.mlp.experts.w13_weight"] = w13_layers[rep]
         self.vllm_state[f"{p}.mlp.experts.w2_weight"] = down_layers[rep]
 
@@ -263,7 +318,7 @@ class Qwen35MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
               axis=1,
           ).reshape(-1, sh_g.shape[1])
 
-          self.vllm_state[f"{p}.mlp.shared_expert.gate_up_proj.weight"] = shared_gate_up
+          self.vllm_state[f"{p}.mlp.shared_expert.gate_up_proj.weight"] = jnp.transpose(shared_gate_up, (1, 0))
           self.vllm_state[f"{p}.mlp.shared_expert.down_proj.weight"] = sh_down_layers[rep]
 
           if "shared_expert_gate" in mlp_block:
