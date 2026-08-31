@@ -79,6 +79,7 @@ def _create_model_converter(
     use_hf_mapping: bool = False,
     use_weight_converter: bool = False,
     use_standalone_converter: bool = False,
+    sharding_hints: Optional[dict] = None,
     debug: bool = False,
 ):
   """Instantiate the converter for a MaxText model name."""
@@ -89,7 +90,12 @@ def _create_model_converter(
     # `_sync_standalone_converted`. Requires vLLM to run its *native* model
     # (no MaxTextForCausalLM overrides).
     if model_name.startswith("qwen3.5"):
-      return Qwen35MaxTextToVLLMConverter(config=config, mesh=mesh)
+      return Qwen35MaxTextToVLLMConverter(
+          config=config,
+          mesh=mesh,
+          vllm_attn_dp=sharding_hints.get("attn_dp_size", 1) if sharding_hints else 1,
+          vllm_use_ep=sharding_hints.get("enable_expert_parallel", False) if sharding_hints else False,
+      )
     if model_name.startswith("gemma4"):
       return Gemma4MaxTextToVLLMConverter(config=config, mesh=mesh)
     raise NotImplementedError(f"use_standalone_converter: no standalone torchax converter for {model_name}")
@@ -658,6 +664,19 @@ class MaxTextVllmRollout(vllm_rollout.VllmRollout):
         getattr(maxtext_config, "use_standalone_converter", False)
         or vllm_additional_config.get("use_standalone_converter", False)
     )
+    # Sampler sharding the standalone converter must mirror: attention DP from
+    # the sharding_strategy blob, expert parallelism from the vLLM engine kwargs.
+    strategy = {}
+    sharding_blob = vllm_additional_config.get("sharding") if isinstance(vllm_additional_config, dict) else None
+    if isinstance(sharding_blob, dict):
+      strategy = sharding_blob.get("sharding_strategy") or {}
+    rollout_vllm_kwargs = getattr(rollout_config, "rollout_vllm_kwargs", None) or {}
+    sharding_hints = {
+        "attn_dp_size": (
+            int(strategy.get("attn_dp_size") or 1) if strategy.get("enable_dp_attention", False) else 1
+        ),
+        "enable_expert_parallel": bool(rollout_vllm_kwargs.get("enable_expert_parallel", False)),
+    }
     # Accepted from either spelling, matching use_weight_converter above, so a
     # debug run can be triggered by editing the same JSON blob.
     self._weight_sync_debug = bool(
@@ -670,6 +689,7 @@ class MaxTextVllmRollout(vllm_rollout.VllmRollout):
         use_hf_mapping=use_hf,
         use_weight_converter=use_weight_converter,
         use_standalone_converter=use_standalone_converter,
+        sharding_hints=sharding_hints,
         debug=self._weight_sync_debug,
     )
 

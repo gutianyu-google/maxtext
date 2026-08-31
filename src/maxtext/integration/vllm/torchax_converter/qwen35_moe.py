@@ -19,12 +19,16 @@ Emits tensors keyed by tpu-inference's torchax runner state names, in the runner
 `process_moe_weights` with the GMM_TP MoE backend):
 
   * linear kernels are stored transposed, ``[in, out]``, with the out dimension of
-    fused projections reordered so each tensor-parallel shard holds its own
-    contiguous ``[q | k | v]`` (or ``[q | k | v | z]``, ``[gate | up]``) block;
-  * KV heads are replicated (each head ``tp // num_kv_heads`` times, consecutively)
-    when ``tp`` exceeds the KV head count, mirroring vLLM's ``QKVParallelLinear``;
-  * routed experts are ``w13 = [E, D, tp * 2 * pad128(F/tp)]`` (per-shard
-    ``[gate | up]`` chunks, each 128-padded) and ``w2 = [E, F, D]``;
+    fused projections reordered so each shard holds its own contiguous
+    ``[q | k | v]`` (or ``[q | k | v | z]``, ``[gate | up]``) block; attention,
+    GDN and the shared expert are sharded ``tp // attn_dp`` ways;
+  * KV heads are replicated (consecutively) when the attention shard count
+    exceeds the KV head count, mirroring vLLM's ``QKVParallelLinear``;
+  * routed experts are ``w2 = [E, F, D]`` and, with the GMM_TP backend,
+    ``w13 = [E, D, tp * 2 * pad128(F/tp)]`` (per-shard ``[gate | up]`` chunks,
+    each 128-padded); under expert parallelism (GMM_EP) the experts are sharded
+    on the expert axis instead and ``w13 = [E, D, 2 * pad128(F)]`` with no
+    per-shard interleave;
   * ``o_proj`` / GDN ``out_proj`` / shared ``down_proj`` are the MaxText kernels
     unchanged -- they are already ``[in, out]``.
 
@@ -42,7 +46,25 @@ from maxtext.integration.vllm.torchax_converter.base import BaseMaxTextToVLLMCon
 
 
 class Qwen35MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
-  """Converts MaxText Qwen3.5 (Scanned Block) layout to vLLM execution layout."""
+  """Converts MaxText Qwen3.5 (Scanned Block) layout to vLLM execution layout.
+
+  `vllm_attn_dp` / `vllm_use_ep` mirror the sampler's sharding
+  (`sharding_strategy.attn_dp_size` / `--enable-expert-parallel`): under
+  attention DP the attention projections are only sharded `tp // attn_dp`
+  ways, and under expert parallelism the routed experts use the GMM_EP layout
+  (experts sharded, no per-TP gate/up interleave) instead of GMM_TP.
+  """
+
+  def __init__(self, config, mesh, vllm_attn_dp: int = 1, vllm_use_ep: bool = False):
+    super().__init__(config, mesh)
+    self.vllm_attn_dp = max(1, int(vllm_attn_dp or 1))
+    self.vllm_use_ep = bool(vllm_use_ep)
+    assert self.vllm_tp % self.vllm_attn_dp == 0, (
+        f"rollout_tensor_parallelism={self.vllm_tp} must be divisible by attn_dp_size={self.vllm_attn_dp}"
+    )
+    # Attention (and GDN / shared-expert column) projections are sharded over
+    # the per-attention-group tensor axis.
+    self.attn_shards = self.vllm_tp // self.vllm_attn_dp
 
   def convert(self, model_state: dict, **kwargs):
     """Converts model_state parameters to vLLM format."""
@@ -87,10 +109,10 @@ class Qwen35MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
     consecutively, as vLLM's QKVParallelLinear lays KV heads out when
     tp > num_kv_heads (rank r reads head r // replicas)."""
     n_kv = kv.shape[1]
-    if self.vllm_tp <= n_kv:
+    if self.attn_shards <= n_kv:
       return kv
-    assert self.vllm_tp % n_kv == 0, f"tp={self.vllm_tp} must be a multiple of num_kv_heads={n_kv}"
-    return jnp.repeat(kv, self.vllm_tp // n_kv, axis=1)
+    assert self.attn_shards % n_kv == 0, f"attention shards={self.attn_shards} must be a multiple of num_kv_heads={n_kv}"
+    return jnp.repeat(kv, self.attn_shards // n_kv, axis=1)
 
   def _convert_attn(self, params):
     """Converts attention weights."""
@@ -137,7 +159,7 @@ class Qwen35MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
           k_T = jnp.transpose(k, (1, 2, 0))
           v_T = jnp.transpose(v, (1, 2, 0))
 
-          tp_size = self.vllm_tp
+          tp_size = self.attn_shards
           q_tp_shards = jnp.split(q_T.reshape(-1, q.shape[0]), tp_size, axis=0)
           k_tp_shards = jnp.split(k_T.reshape(-1, k.shape[0]), tp_size, axis=0)
           v_tp_shards = jnp.split(v_T.reshape(-1, v.shape[0]), tp_size, axis=0)
@@ -190,7 +212,7 @@ class Qwen35MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
           v = t_r[:, 2 * D_k : 2 * D_k + V_per_K * D_v, :].reshape(H_v * D_v, -1)
           z = t_r[:, 2 * D_k + V_per_K * D_v :, :].reshape(H_v * D_v, -1)
 
-          tp_size = self.vllm_tp
+          tp_size = self.attn_shards
           q_shards = jnp.split(q, tp_size, axis=0)
           k_shards = jnp.split(k, tp_size, axis=0)
           v_shards = jnp.split(v, tp_size, axis=0)
@@ -254,7 +276,9 @@ class Qwen35MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
       wi_1 = jnp.transpose(routed["wi_1"], (1, 0, 2, 3))
 
       num_reps, num_experts, d_model, d_inner = wi_0.shape
-      tp_size = self.vllm_tp
+      # GMM_EP (expert parallelism) shards experts and keeps [gate | up] whole;
+      # GMM_TP interleaves per-TP gate/up chunks.
+      tp_size = 1 if self.vllm_use_ep else self.vllm_tp
 
       # vLLM's TPU Grouped GEMM kernel requires 128-alignment per expert chunk
       chunk_size = d_inner // tp_size
@@ -308,12 +332,12 @@ class Qwen35MaxTextToVLLMConverter(BaseMaxTextToVLLMConverter):
 
         if has_shared:
           sh_g, sh_u = sh_gate_layers[rep], sh_up_layers[rep]
-          sh_per_tp = sh_g.shape[0] // self.vllm_tp
+          sh_per_tp = sh_g.shape[0] // self.attn_shards
 
           shared_gate_up = jnp.concatenate(
               [
-                  sh_g.reshape(self.vllm_tp, sh_per_tp, sh_g.shape[1]),
-                  sh_u.reshape(self.vllm_tp, sh_per_tp, sh_u.shape[1]),
+                  sh_g.reshape(self.attn_shards, sh_per_tp, sh_g.shape[1]),
+                  sh_u.reshape(self.attn_shards, sh_per_tp, sh_u.shape[1]),
               ],
               axis=1,
           ).reshape(-1, sh_g.shape[1])
