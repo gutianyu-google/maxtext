@@ -604,6 +604,14 @@ class LogitsAndLoss(BaseModel):
   )
   logits_dot_in_fp32: bool = Field(False, description="Use fp32 for the logits dot product for stability.")
   cast_logits_to_fp32: bool = Field(True, description="Whether to cast the final logits to fp32.")
+  lm_head_kernel_transposed: bool = Field(
+      False,
+      description=(
+          "Store the untied LM head kernel as [vocab, embed] rather than [embed, vocab] so autodiff produces the "
+          "weight gradient already in the kernel's orientation. Speeds up shard_mode=explicit and slows down "
+          "shard_mode=auto. Changes the on-disk shape of params-decoder-logits_dense-kernel."
+      ),
+  )
   final_logits_soft_cap: None | NonNegativeFloat = Field(
       None,
       description="Soft-cap value for the final logits. None or 0.0 means no cap.",
@@ -3267,6 +3275,15 @@ class MaxTextConfig(
           "shard_embed_moe_on_fsdp requires quantization to be specified and "
           "weight_quantization_calibration_method to be fixed (static scaling mode)."
       )
+    return self
+
+  @model_validator(mode="after")
+  def validate_lm_head_kernel_transposed(self) -> "MaxTextConfig":
+    """Reject lm_head_kernel_transposed in the configurations where it cannot be honored."""
+    if not self.lm_head_kernel_transposed:
+      return self
+    if self.logits_via_embedding:
+      raise ValueError("lm_head_kernel_transposed only applies to the untied LM head, but logits_via_embedding is True.")
     return self
 
   @model_validator(mode="after")

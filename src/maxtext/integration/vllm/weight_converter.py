@@ -378,6 +378,10 @@ MODEL_TO_CONVERSION_RULES = {
     "qwen3_moe": [
         Rule(["base.token_embedder.embedding"], "vllm_model.model.embed_tokens.weight"),
         Rule(["base.decoder.decoder_norm.scale"], "vllm_model.model.norm.weight"),
+        # Assumes the default [embed, vocab] kernel orientation. Under
+        # `lm_head_kernel_transposed: true` the kernel is already [vocab, embed], i.e. vLLM's
+        # own layout, and this Transpose must be dropped. This table is looked up without a
+        # config, so that combination is currently unsupported rather than handled.
         Rule(["base.decoder.logits_dense.kernel"], "vllm_model.lm_head.weight", [Transpose(axes=(1, 0))]),
         Rule(
             ["base.decoder.layers.pre_self_attention_layer_norm.scale"],

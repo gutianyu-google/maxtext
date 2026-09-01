@@ -123,6 +123,13 @@ class VllmWeightMapping:
     self.config = config
     self.use_standalone_mappings = use_standalone_mappings
     self._sharding_knowledge_map = _SHARDING_KNOWLEDGE_MAP
+    if getattr(config, "lm_head_kernel_transposed", False):
+      # The LM head kernel is stored [vocab, embed] rather than [embed, vocab]. Both
+      # specs have rank 2, so getting this wrong mis-shards silently instead of raising.
+      self._sharding_knowledge_map = {
+          **_SHARDING_KNOWLEDGE_MAP,
+          "base.decoder.logits_dense.kernel": ("model", None),
+      }
 
   def to_hf_mapping(self):
     """Returns a mapping from MaxText parameter names to HuggingFace parameter names."""

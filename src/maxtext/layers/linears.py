@@ -132,6 +132,7 @@ class DenseGeneral(nnx.Module):
       mesh: Mesh | None = None,
       use_two_stage_all_gather: bool = False,
       debug_sharding: bool = False,
+      kernel_transposed: bool = False,
       *,  # Following arguments are keyword-only
       rngs: nnx.Rngs = None,
   ):
@@ -158,6 +159,17 @@ class DenseGeneral(nnx.Module):
         transpose XLA emits for a single combined 2-axis all-gather.
       debug_sharding: when True, log the logical/physical sharding of the
         two-stage all-gather constraints to the sharding dump files.
+      kernel_transposed: store the kernel as `out_features + in_features`
+        instead of the default `in_features + out_features`, contracting on its
+        trailing axes. The forward matmul is mathematically unchanged, but the
+        weight gradient is then produced in the kernel's own orientation, so
+        autodiff emits no transpose after the gradient dot. See
+        docs/guides/optimization/shard_mode_performance.md section 4.3 for why
+        that transpose is expensive under `shard_mode: explicit`. `kernel_axes`
+        is permuted to match, so callers pass logical axes in the usual
+        `in..., out...` order either way. Not supported together with `quant`,
+        `slice_bounds` or a pre-existing checkpoint written in the default
+        orientation.
       rngs: RNG state for initialization in nnx.
     """
     self.in_features_shape = canonicalize_tuple(in_features_shape)
@@ -175,11 +187,26 @@ class DenseGeneral(nnx.Module):
     self.mesh = mesh
     self.use_two_stage_all_gather = use_two_stage_all_gather
     self.debug_sharding = debug_sharding
+    self.kernel_transposed = kernel_transposed
+
+    n_in = len(self.in_features_shape)
+    n_out = len(self.out_features_shape)
+    if kernel_transposed:
+      if quant is not None:
+        raise ValueError("kernel_transposed is not supported together with quantization.")
+      # Permute the logical axes alongside the shape so `sharding=` keeps
+      # describing the axis it did before the flip.
+      self.kernel_axes = tuple(self.kernel_axes[n_in:]) + tuple(self.kernel_axes[:n_in])
 
     # Parameter initialization
-    kernel_shape = self.in_features_shape + self.out_features_shape
-    kernel_in_axis = np.arange(len(self.axis))
-    kernel_out_axis = np.arange(len(self.axis), len(self.axis) + len(self.out_features_shape))
+    if kernel_transposed:
+      kernel_shape = self.out_features_shape + self.in_features_shape
+      kernel_in_axis = np.arange(n_out, n_out + len(self.axis))
+      kernel_out_axis = np.arange(n_out)
+    else:
+      kernel_shape = self.in_features_shape + self.out_features_shape
+      kernel_in_axis = np.arange(len(self.axis))
+      kernel_out_axis = np.arange(len(self.axis), len(self.axis) + n_out)
 
     if not quantizations.in_serve_mode(self.quant):
       self.kernel = nnx.Param(
@@ -194,8 +221,12 @@ class DenseGeneral(nnx.Module):
       )
 
     if self.use_bias:
-      bias_axes = self.kernel_axes[-len(self.out_features_shape) :]
-      bias_shape = kernel_shape[-len(self.out_features_shape) :]
+      if kernel_transposed:
+        bias_axes = self.kernel_axes[:n_out]
+        bias_shape = kernel_shape[:n_out]
+      else:
+        bias_axes = self.kernel_axes[-n_out:]
+        bias_shape = kernel_shape[-n_out:]
       self.bias = nnx.Param(
           default_bias_init(rngs.params(), bias_shape, self.weight_dtype),
           sharding=bias_axes,
@@ -299,6 +330,10 @@ class DenseGeneral(nnx.Module):
     if slice_bounds is not None:
       if self.quant is not None:
         raise ValueError("sliced contraction is only supported when quant is None")
+      if self.kernel_transposed:
+        # slice_bounds slices the trailing (output-feature) axis, which a
+        # transposed kernel keeps at the front.
+        raise ValueError("sliced contraction is not supported when kernel_transposed is True")
       begin, end = slice_bounds
       if not 0 <= begin < end <= kernel.shape[-1]:
         raise ValueError(f"slice_bounds {slice_bounds} must be valid and within [0, {kernel.shape[-1]}]")
@@ -310,7 +345,14 @@ class DenseGeneral(nnx.Module):
     if self.shard_mode != ShardMode.EXPLICIT:
       out_sharding = None
 
-    contract_ind = tuple(range(0, len(self.axis)))
+    if self.kernel_transposed:
+      # A transposed kernel is stored as out_features + in_features, so the
+      # contracting axes are its trailing ones. dot_general emits batch +
+      # lhs-free + rhs-free dims, so the output order is unchanged.
+      n_out = len(self.out_features_shape)
+      contract_ind = tuple(range(n_out, n_out + len(self.axis)))
+    else:
+      contract_ind = tuple(range(0, len(self.axis)))
     output = _compute_dot_general_nnx(
         inputs,
         kernel,
@@ -346,6 +388,7 @@ def dense_general(
     shard_mode: ShardMode = ShardMode.AUTO,
     matmul_precision: str = "default",
     parameter_memory_host_offload: bool = False,
+    kernel_transposed: bool = False,
     name: None | str = None,
 ):
   """Creates a DenseGeneral Linen module using nnx.bridge.to_linen.
@@ -365,6 +408,8 @@ def dense_general(
     shard_mode: indicating the shard mode
     matmul_precision: Precision for matrix multiplication.
     parameter_memory_host_offload: Determines whether to offload params to host
+    kernel_transposed: store the kernel as `out_features + in_features`; see
+      DenseGeneral for details.
     name: name passed to the ToLinen Module
   """
   if not (inputs_shape is not None) ^ (in_features_shape is not None):
@@ -389,6 +434,7 @@ def dense_general(
       shard_mode=shard_mode,
       matmul_precision=matmul_precision,
       parameter_memory_host_offload=parameter_memory_host_offload,
+      kernel_transposed=kernel_transposed,
       name=name,
       metadata_fn=variable_to_logically_partitioned,
       abstract_init=False,

@@ -200,6 +200,13 @@ logits_via_embedding: false
 normalize_embedding_logits: true  # whether to normalize pre-softmax logits if logits_via_embedding is true
 logits_dot_in_fp32: false  # whether to use fp32 in logits_dense or shared_embedding dot product for stability
 cast_logits_to_fp32: true # whether to cast the logits to fp32. the higher precision is generally beneficial, but it can vary slightly.
+# Store the untied LM head kernel as [vocab, embed] instead of [embed, vocab]. Mathematically identical, but the
+# weight gradient then comes out in the kernel's own orientation, so XLA needs no transpose after it. Under
+# shard_mode: explicit that transpose cannot be folded away (see docs/guides/optimization/shard_mode_performance.md),
+# which costs a reduce-scatter and forces relayout copies on the entry parameters. Only useful with
+# shard_mode: explicit; it makes auto slower. NOTE: this changes the on-disk checkpoint shape of
+# `params-decoder-logits_dense-kernel`, so it cannot be flipped on an existing run without transposing that array.
+lm_head_kernel_transposed: false
 float32_qk_product: false # in dot_product attention, whether to cast to fp32 the inputs to qk product
 float32_logits: false # in dot_product attention, whether to cast to fp32 the inputs to softmax
 mla_qk_head_chunk_size: 0 # Limits HBM footprint by sequentially evaluating the QK matrix in the Indexer across the unsharded local heads dimension natively.

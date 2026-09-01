@@ -471,6 +471,7 @@ class NNXDecoder(nnx.Module):
           shard_mode=config.shard_mode,
           matmul_precision=self.config.matmul_precision,
           parameter_memory_host_offload=config.parameter_memory_host_offload,
+          kernel_transposed=config.lm_head_kernel_transposed,
           rngs=rngs,
       )
 

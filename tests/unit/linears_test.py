@@ -180,6 +180,91 @@ class DenseGeneralTest(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "slice_bounds .* must be valid and within"):
       layer(inputs, slice_bounds=(0, 100))
 
+  def _make_transposed_pair(self, out_features_shape, kernel_axes, use_bias=False):
+    """Builds a default and a kernel_transposed layer holding the same weights."""
+    kwargs = {
+        "in_features_shape": 4,
+        "out_features_shape": out_features_shape,
+        "kernel_axes": kernel_axes,
+        "use_bias": use_bias,
+    }
+    default = linears.DenseGeneral(**kwargs, kernel_transposed=False, rngs=nnx.Rngs(params=0))
+    transposed = linears.DenseGeneral(**kwargs, kernel_transposed=True, rngs=nnx.Rngs(params=0))
+    # The two initializers draw differently-shaped arrays from the same key, so copy
+    # the weights across to compare the math rather than the RNG stream.
+    n_in = 1
+    kernel = default.kernel[...]
+    perm = tuple(range(n_in, kernel.ndim)) + tuple(range(n_in))
+    transposed.kernel = nnx.Param(jnp.transpose(kernel, perm), sharding=transposed.kernel_axes)
+    if use_bias:
+      transposed.bias = nnx.Param(default.bias[...], sharding=transposed.bias.sharding)
+    return default, transposed, perm
+
+  def test_kernel_transposed_shape_and_axes(self):
+    default, transposed, _ = self._make_transposed_pair(8, ("embed", "vocab"))
+    self.assertEqual(default.kernel[...].shape, (4, 8))
+    self.assertEqual(transposed.kernel[...].shape, (8, 4))
+    self.assertEqual(default.kernel_axes, ("embed", "vocab"))
+    self.assertEqual(transposed.kernel_axes, ("vocab", "embed"))
+
+  def test_kernel_transposed_forward_matches(self):
+    for out_features_shape, kernel_axes in ((8, ("embed", "vocab")), ((2, 8), ("embed", "heads", "kv"))):
+      with self.subTest(out_features_shape=out_features_shape):
+        default, transposed, _ = self._make_transposed_pair(out_features_shape, kernel_axes)
+        inputs = jax.random.normal(jax.random.PRNGKey(0), (2, 3, 4))
+        np.testing.assert_array_equal(default(inputs), transposed(inputs))
+
+  def test_kernel_transposed_gradient_matches(self):
+    default, transposed, perm = self._make_transposed_pair(8, ("embed", "vocab"))
+    inputs = jax.random.normal(jax.random.PRNGKey(0), (2, 3, 4))
+
+    def loss(layer, x):
+      return jnp.sum(jnp.sin(layer(x)))
+
+    grad_default = nnx.grad(loss)(default, inputs).kernel[...]
+    grad_transposed = nnx.grad(loss)(transposed, inputs).kernel[...]
+    # The gradient comes out in each layer's own kernel orientation. That is the
+    # whole point of the flag: no transpose is needed after the gradient dot.
+    self.assertEqual(grad_default.shape, default.kernel[...].shape)
+    self.assertEqual(grad_transposed.shape, transposed.kernel[...].shape)
+    np.testing.assert_array_equal(grad_default, jnp.transpose(grad_transposed, np.argsort(perm)))
+
+  def test_kernel_transposed_bias(self):
+    default, transposed, _ = self._make_transposed_pair(8, ("embed", "vocab"), use_bias=True)
+    self.assertEqual(transposed.bias[...].shape, default.bias[...].shape)
+    inputs = jax.random.normal(jax.random.PRNGKey(0), (2, 3, 4))
+    np.testing.assert_array_equal(default(inputs), transposed(inputs))
+
+  def test_kernel_transposed_init_statistics_match(self):
+    # fan-in must still be read off the in_features axes, so the two orientations
+    # draw from the same distribution.
+    default = linears.DenseGeneral(in_features_shape=64, out_features_shape=4096, rngs=nnx.Rngs(params=7))
+    transposed = linears.DenseGeneral(
+        in_features_shape=64, out_features_shape=4096, kernel_transposed=True, rngs=nnx.Rngs(params=7)
+    )
+    np.testing.assert_allclose(jnp.std(default.kernel[...]), jnp.std(transposed.kernel[...]), rtol=1e-2)
+
+  def test_kernel_transposed_rejects_quantization(self):
+    with self.assertRaisesRegex(ValueError, "kernel_transposed is not supported together with quantization"):
+      linears.DenseGeneral(
+          in_features_shape=4,
+          out_features_shape=8,
+          quant=MagicMock(),
+          kernel_transposed=True,
+          rngs=self.rngs,
+      )
+
+  def test_kernel_transposed_rejects_slice_bounds(self):
+    layer = linears.DenseGeneral(
+        in_features_shape=4,
+        out_features_shape=8,
+        kernel_transposed=True,
+        rngs=self.rngs,
+    )
+    inputs = jax.random.normal(jax.random.PRNGKey(0), (2, 4))
+    with self.assertRaisesRegex(ValueError, "sliced contraction is not supported when kernel_transposed"):
+      layer(inputs, slice_bounds=(0, 3))
+
   def _run_dense_test(self, axis, in_feat_shape, expected_shape):
     batch_size = 2
     seq_len = 3
