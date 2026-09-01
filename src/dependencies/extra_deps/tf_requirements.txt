@@ -1,0 +1,3 @@
+tensorflow==2.20.0
+tensorflow-datasets
+tensorflow-text==2.20.1
